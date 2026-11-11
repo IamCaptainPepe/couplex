@@ -21,9 +21,21 @@ const USED = new Set();
 let replaced = 0;
 let candidates = 0;
 let pageAgreed = false;
+let started = false;
 let opts = { ...DEFAULTS };
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+// start the TLS handshake with the photo CDN before anything else happens
+try {
+  const pc = document.createElement('link');
+  pc.rel = 'preconnect';
+  pc.href = 'https://cdn.jsdelivr.net';
+  pc.crossOrigin = '';
+  (document.head || document.documentElement).appendChild(pc);
+} catch (e) {
+  /* document is empty this early, the first request will pay the handshake */
+}
 
 function prepare(img) {
   // <picture><source> overrides src, so drop the sources first
@@ -32,7 +44,7 @@ function prepare(img) {
   img.removeAttribute('srcset');
   img.removeAttribute('sizes');
   img.loading = 'eager';
-  img.decoding = 'sync';
+  img.decoding = 'async';
 }
 
 // Where to place the photo inside the element box so the head survives.
@@ -230,15 +242,16 @@ function runBatch(list, fraction) {
 }
 
 function start() {
+  if (started) return;
+  started = true;
+
   // one roll per page
   pageAgreed = Math.random() * 100 < opts.pageChance;
   if (!pageAgreed) return;
 
   const all = collect();
   candidates = all.length;
-  if (!all.length) return;
-
-  runBatch(all, opts.imagePercent / 100);
+  if (all.length) runBatch(all, opts.imagePercent / 100);
 
   // images that arrive later (lazy-load, infinite feeds, SPAs) and images whose
   // src is swapped in place (virtualised feeds like YouTube) — both count
@@ -282,7 +295,7 @@ function start() {
       }
     }
   });
-  mo.observe(document.documentElement, {
+  mo.observe(document, {
     childList: true,
     subtree: true,
     attributes: true,
@@ -305,29 +318,37 @@ function start() {
   }, 2000);
 }
 
-async function load() {
-  const stored = await chrome.storage.sync.get({ [KEY]: DEFAULTS });
-  opts = { ...DEFAULTS, ...stored[KEY] };
-  if (!opts.enabled) return;
+const INDEX_TTL = 6 * 3600 * 1000;
+const lget = (d) => new Promise((r) => chrome.storage.local.get(d, r));
+const lset = (o) => new Promise((r) => chrome.storage.local.set(o, () => r()));
 
-  // pin the file CDN to the current commit so new photos show up right away
-  const sha = await cdnRef();
-  if (sha) CDN = `https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@${sha}/images/`;
+async function apiSha() {
+  try {
+    const res = await fetch(BRANCH_API, { cache: 'no-store' });
+    const j = await res.json();
+    return (j && j.commit && j.commit.sha) || '';
+  } catch (e) {
+    return '';
+  }
+}
 
+async function fetchIndex(sha) {
   const sources = sha ? [CDN + 'index.json', RAW_INDEX] : [RAW_INDEX, CDN_REF + 'index.json'];
-  IMAGES = [];
   for (const url of sources) {
     try {
       const res = await fetch(url, { cache: url === RAW_INDEX ? 'no-cache' : 'force-cache' });
       const data = await res.json();
-      IMAGES = Array.isArray(data) ? data.map((n) => ({ n, w: 0, h: 0, f: null, b: n })) : data.images;
-      if (IMAGES && IMAGES.length) break;
+      const list = Array.isArray(data) ? data.map((n) => ({ n, w: 0, h: 0, f: null, b: n })) : data.images;
+      if (list && list.length) return list;
     } catch (e) {
-      /* try the next source */
+      /* next source */
     }
   }
-  if (!IMAGES || !IMAGES.length) return;
+  return null;
+}
 
+function applyIndex(list) {
+  IMAGES = list;
   VARIANTS.clear();
   BASES = [];
   for (const it of IMAGES) {
@@ -338,8 +359,68 @@ async function load() {
     }
     VARIANTS.get(b).push(it);
   }
+}
 
-  start();
+// the first screenful of a feed should not wait for the network at all
+function warmCache(n) {
+  const idle = window.requestIdleCallback || ((f) => setTimeout(f, 900));
+  idle(() => {
+    if (!BASES.length) return;
+    const pool = BASES.slice();
+    for (let i = pool.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    for (const b of pool.slice(0, n)) {
+      const it = variantFor(b, 1.5) || (VARIANTS.get(b) || [])[0];
+      if (!it) continue;
+      const im = new Image();
+      im.decoding = 'async';
+      im.src = CDN + it.n;
+    }
+  });
+}
+
+// everything network-related happens after the first frame
+async function refresh() {
+  const got = await lget({ couplexSha: null, couplexIndex: null });
+  let sha = (got.couplexSha && got.couplexSha.sha) || '';
+  if (!sha || Date.now() - (got.couplexSha.t || 0) > SHA_TTL) {
+    const fresh = await apiSha();
+    if (fresh) {
+      sha = fresh;
+      lset({ couplexSha: { t: Date.now(), sha } });
+    }
+  }
+  if (sha) CDN = `https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@${sha}/images/`;
+
+  const stale = !got.couplexIndex || Date.now() - got.couplexIndex.t > INDEX_TTL;
+  if (!stale) return;
+  const list = await fetchIndex(sha);
+  if (!list) return;
+  applyIndex(list);
+  lset({ couplexIndex: { t: Date.now(), list } });
+}
+
+async function load() {
+  const stored = await chrome.storage.sync.get({ [KEY]: DEFAULTS });
+  opts = { ...DEFAULTS, ...stored[KEY] };
+  if (!opts.enabled) return;
+
+  // instant path: whatever was cached from the previous page
+  const got = await lget({ couplexIndex: null });
+  if (got.couplexIndex && got.couplexIndex.list && got.couplexIndex.list.length) {
+    applyIndex(got.couplexIndex.list);
+    start();
+    warmCache(24);
+  }
+
+  // slow path: refresh the commit sha and the index in the background
+  refresh().then(() => {
+    if (!BASES.length) return;
+    start();
+    if (!got.couplexIndex) warmCache(24);
+  });
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
