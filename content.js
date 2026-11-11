@@ -101,31 +101,31 @@ function choose(bw, bh) {
   return fallback;
 }
 
-// photos live in the `data` branch of the repo and are served by jsDelivr,
-// so the extension itself stays tiny
-const CDN = 'https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@data/images/';
-const LIST_API = 'https://data.jsdelivr.com/v1/package/gh/IamCaptainPepe/couplex@data/flat?structure=flat';
-const LIST_TTL = 6 * 3600 * 1000;
+// photos live in the `data` branch of the repo: the list comes from
+// raw.githubusercontent (updates within a minute of a push), the files
+// themselves from jsDelivr pinned to the exact commit (immutable, cached)
+const RAW_INDEX = 'https://raw.githubusercontent.com/IamCaptainPepe/couplex/data/images/index.json';
+const BRANCH_API = 'https://api.github.com/repos/IamCaptainPepe/couplex/branches/data';
+const CDN_REF = 'https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@data/images/';
+const SHA_TTL = 3600 * 1000;
+let CDN = CDN_REF;
 
-// files in the data branch that index.json does not know about yet
-async function cdnFiles() {
+// current commit of the data branch, so jsDelivr never serves a stale ref
+async function cdnRef() {
   try {
-    const got = await new Promise((r) => chrome.storage.local.get({ couplexFiles: null }, r));
-    const hit = got.couplexFiles;
-    if (hit && Date.now() - hit.t < LIST_TTL) return hit.files || [];
+    const got = await new Promise((r) => chrome.storage.local.get({ couplexSha: null }, r));
+    const hit = got.couplexSha;
+    if (hit && hit.sha && Date.now() - hit.t < SHA_TTL) return hit.sha;
   } catch (e) {
-    /* storage may be unavailable, fall through to the network */
+    /* storage unavailable, ask the api */
   }
   try {
-    const res = await fetch(LIST_API, { cache: 'no-cache' });
-    const data = await res.json();
-    const files = (data.files || [])
-      .map((f) => (f.name || '').replace(/^\/?images\//, ''))
-      .filter((n) => /\.(avif|webp|png|jpe?g)$/i.test(n));
-    chrome.storage.local.set({ couplexFiles: { t: Date.now(), files } });
-    return files;
+    const res = await fetch(BRANCH_API, { cache: 'no-store' });
+    const sha = (await res.json()).commit.sha;
+    if (sha) chrome.storage.local.set({ couplexSha: { t: Date.now(), sha } });
+    return sha;
   } catch (e) {
-    return [];
+    return '';
   }
 }
 
@@ -172,6 +172,13 @@ function replace(img) {
   prepare(img);
   img.dataset.couplex = '1';
   img.src = CDN + picked.item.n;
+
+  // a photo may be newer than the cached branch sha — fall back to the branch
+  img.addEventListener('error', function retry() {
+    if (img.dataset.couplexRetry) return;
+    img.dataset.couplexRetry = '1';
+    img.src = CDN_REF + picked.item.n;
+  }, { once: true });
   img.style.objectFit = 'cover';
   img.style.objectPosition = picked.pos;
 
@@ -246,7 +253,7 @@ async function load() {
   if (!opts.enabled) return;
 
   try {
-    const res = await fetch(CDN + 'index.json', { cache: 'force-cache' });
+    const res = await fetch(RAW_INDEX, { cache: 'no-cache' });
     const data = await res.json();
     IMAGES = Array.isArray(data) ? data.map((n) => ({ n, w: 0, h: 0, f: null, b: n })) : data.images;
   } catch (e) {
@@ -254,13 +261,9 @@ async function load() {
   }
   if (!IMAGES || !IMAGES.length) return;
 
-  // photos added to the data branch after index.json was built
-  try {
-    const extra = await cdnFiles();
-    mergeScanned(extra);
-  } catch (e) {
-    /* the worker may be asleep or blocked, the generated set still works */
-  }
+  // pin the file CDN to the current commit so new photos show up right away
+  const sha = await cdnRef();
+  if (sha) CDN = `https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@${sha}/images/`;
 
   VARIANTS.clear();
   BASES = [];
