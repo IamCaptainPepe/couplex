@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Couplex</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --fg: #111827;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --accent: #2563eb;
+      --track: #dbeafe;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f172a;
+        --fg: #f8fafc;
+        --muted: #94a3b8;
+        --line: #1e293b;
+        --accent: #3b82f6;
+        --track: #1e3a8a;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      width: 300px;
+      margin: 0;
+      padding: 14px 16px 16px;
+      background: var(--bg);
+      color: var(--fg);
+      font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    h1 { font-size: 16px; margin: 0; letter-spacing: -0.01em; }
+    .switch { position: relative; width: 42px; height: 24px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider-switch {
+      position: absolute; inset: 0; cursor: pointer;
+      background: var(--line); border-radius: 999px; transition: background .15s;
+    }
+    .slider-switch::before {
+      content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px;
+      background: #fff; border-radius: 50%; transition: transform .15s;
+      box-shadow: 0 1px 2px rgba(0,0,0,.3);
+    }
+    .switch input:checked + .slider-switch { background: var(--accent); }
+    .switch input:checked + .slider-switch::before { transform: translateX(18px); }
+    .field { margin-bottom: 13px; }
+    .row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
+    .label { color: var(--fg); }
+    .value { font-variant-numeric: tabular-nums; color: var(--muted); }
+    input[type=range] {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 4px; border-radius: 999px;
+      background: var(--track); outline: none;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: var(--accent); cursor: pointer;
+      border: 2px solid var(--bg);
+    }
+    .hint { color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+    footer {
+      display: flex; justify-content: space-between;
+      border-top: 1px solid var(--line); margin-top: 14px; padding-top: 10px;
+      color: var(--muted); font-size: 11.5px;
+    }
+    footer b { color: var(--fg); font-weight: 600; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Couplex</h1>
+    <label class="switch">
+      <input type="checkbox" id="enabled" checked>
+      <span class="slider-switch"></span>
+    </label>
+  </header>
+
+  <div class="field">
+    <div class="row"><span class="label">Page chance</span><span class="value" id="pageChanceVal">40%</span></div>
+    <input type="range" id="pageChance" min="0" max="100" step="5" value="40">
+    <div class="hint">Odds that this page gets any replacement at all.</div>
+  </div>
+
+  <div class="field">
+    <div class="row"><span class="label">Images to replace</span><span class="value" id="imagePercentVal">35%</span></div>
+    <input type="range" id="imagePercent" min="0" max="100" step="5" value="35">
+    <div class="hint">Share of images on a page that won the roll.</div>
+  </div>
+
+  <div class="field">
+    <div class="row"><span class="label">Minimum size</span><span class="value" id="minSizeVal">64 px</span></div>
+    <input type="range" id="minSize" min="0" max="300" step="8" value="64">
+    <div class="hint">Smaller images are left alone.</div>
+  </div>
+
+  <footer>
+    <span>This page: <b id="pageCount">—</b></span>
+    <span>In set: <b id="setCount">—</b></span>
+  </footer>
+  <div class="hint">Settings apply after you reload the page.</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
