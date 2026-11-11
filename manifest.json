@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Couplex",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Replaces images on every page with photos of Alex Cooper.",
   "permissions": ["storage"],
   "host_permissions": ["<all_urls>", "https://cdn.jsdelivr.net/*", "https://data.jsdelivr.com/*"],

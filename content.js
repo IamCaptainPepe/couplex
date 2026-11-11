@@ -252,18 +252,23 @@ async function load() {
   opts = { ...DEFAULTS, ...stored[KEY] };
   if (!opts.enabled) return;
 
-  try {
-    const res = await fetch(RAW_INDEX, { cache: 'no-cache' });
-    const data = await res.json();
-    IMAGES = Array.isArray(data) ? data.map((n) => ({ n, w: 0, h: 0, f: null, b: n })) : data.images;
-  } catch (e) {
-    IMAGES = [];
-  }
-  if (!IMAGES || !IMAGES.length) return;
-
   // pin the file CDN to the current commit so new photos show up right away
   const sha = await cdnRef();
   if (sha) CDN = `https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@${sha}/images/`;
+
+  const sources = sha ? [CDN + 'index.json', RAW_INDEX] : [RAW_INDEX, CDN_REF + 'index.json'];
+  IMAGES = [];
+  for (const url of sources) {
+    try {
+      const res = await fetch(url, { cache: url === RAW_INDEX ? 'no-cache' : 'force-cache' });
+      const data = await res.json();
+      IMAGES = Array.isArray(data) ? data.map((n) => ({ n, w: 0, h: 0, f: null, b: n })) : data.images;
+      if (IMAGES && IMAGES.length) break;
+    } catch (e) {
+      /* try the next source */
+    }
+  }
+  if (!IMAGES || !IMAGES.length) return;
 
   VARIANTS.clear();
   BASES = [];
