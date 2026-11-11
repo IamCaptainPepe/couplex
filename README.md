@@ -1,8 +1,7 @@
 # Couplex
 
 A Chrome / Edge / Firefox extension that replaces the images on every web page
-with photos of Alex Cooper. Inspired by [nCage](https://github.com/Fortyseven/nCage),
-but instead of Nicolas Cage the whole internet turns into Alex.
+with photos of Alex Cooper.
 
 The extension itself is tiny (~50 KB). The photo set lives on a CDN, so the
 extension can grow to thousands of photos without getting any heavier.
@@ -36,16 +35,17 @@ extension can grow to thousands of photos without getting any heavier.
 Photos are **not** shipped inside the extension. They are served from jsDelivr:
 
 ```
-https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@data/images/
+https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@<commit>/images/
 ```
 
 - `index.json` — the list of photos with face coordinates and dimensions.
 - `*_sq.avif`, `*_l.avif`, `*_p.avif` — three crops of the same photo.
 
 The `data` branch of this repository holds only `images/`. The `master` branch
-holds only the extension code. New photos are picked up automatically: the
-extension asks the jsDelivr file API once every 6 hours and merges any file that
-is not in `index.json` yet (those use a centre crop).
+holds only the extension code. At load time the extension asks the GitHub API
+for the current commit of `data`, pins every URL to that commit (so CDN cache
+can never serve a stale index) and falls back to the raw GitHub URL, then to the
+`data` branch directly, if a file is not there yet.
 
 ## Adding photos
 
@@ -55,8 +55,8 @@ is not in `index.json` yet (those use a centre crop).
 python3 tools/build_images.py _src2 --max 768 --quality 52 --format avif --speed 6 --incremental
 
 # 3. publish the data branch
-git checkout data
-git add images
+cd ../couplex-data        # worktree on branch `data`
+git add -f images
 git commit -m "data: new photos"
 git push origin data
 ```
@@ -71,15 +71,14 @@ three ways around the head box, encodes to AVIF and rewrites `images/index.json`
 | `manifest.json` | MV3 manifest, no background worker needed |
 | `content.js` | page scanner, CDN loader, placement logic |
 | `popup.html` / `popup.js` | settings UI |
-| `worker.js` | unused leftover, safe to delete |
 | `tools/build_images.py` | photo set builder |
 | `icons/` | extension icons |
 
 ## Privacy
 
-The extension makes exactly two kinds of network requests, both to jsDelivr:
-the photo index and the photos themselves. No analytics, no tracking, nothing
-is sent about the pages you visit.
+The extension makes exactly two kinds of network requests: the photo index and
+the photos themselves. Both go to jsDelivr and GitHub. No analytics, no
+tracking, nothing is sent about the pages you visit.
 
 ## Limitations
 

@@ -1,6 +1,6 @@
 // Couplex — replaces images on a page with photos of Alex Cooper.
-// Same idea as nCage: the page first wins or loses a single roll, then a
-// percentage of the images on a winning page get swapped.
+// Every page first wins or loses a single roll, then a percentage of the
+// images on a winning page get swapped.
 //
 // Faces are never cut off: index.json stores a face box per photo and
 // object-position is computed so the whole face fits the visible window.
