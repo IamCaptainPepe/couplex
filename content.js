@@ -101,9 +101,52 @@ function choose(bw, bh) {
   return fallback;
 }
 
+// photos live in the `data` branch of the repo and are served by jsDelivr,
+// so the extension itself stays tiny
+const CDN = 'https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@data/images/';
+const LIST_API = 'https://data.jsdelivr.com/v1/package/gh/IamCaptainPepe/couplex@data/flat?structure=flat';
+const LIST_TTL = 6 * 3600 * 1000;
+
+// files in the data branch that index.json does not know about yet
+async function cdnFiles() {
+  try {
+    const got = await new Promise((r) => chrome.storage.local.get({ couplexFiles: null }, r));
+    const hit = got.couplexFiles;
+    if (hit && Date.now() - hit.t < LIST_TTL) return hit.files || [];
+  } catch (e) {
+    /* storage may be unavailable, fall through to the network */
+  }
+  try {
+    const res = await fetch(LIST_API, { cache: 'no-cache' });
+    const data = await res.json();
+    const files = (data.files || [])
+      .map((f) => (f.name || '').replace(/^\/?images\//, ''))
+      .filter((n) => /\.(avif|webp|png|jpe?g)$/i.test(n));
+    chrome.storage.local.set({ couplexFiles: { t: Date.now(), files } });
+    return files;
+  } catch (e) {
+    return [];
+  }
+}
+
+// name, crop suffix gives the shape
+function mergeScanned(files) {
+  const known = new Set(IMAGES.map((it) => it.n));
+  const shapes = { sq: 1, l: 1.5, p: 2 / 3 };
+  let added = 0;
+  for (const name of files || []) {
+    if (known.has(name)) continue;
+    const m = /^(.+)_(sq|l|p)\.(webp|avif|png|jpe?g)$/i.exec(name);
+    if (!m) continue;
+    const shape = shapes[m[2].toLowerCase()];
+    IMAGES.push({ n: name, w: Math.round(1000 * shape), h: 1000, f: null, b: m[1] });
+    added += 1;
+  }
+  return added;
+}
+
 // among the crops of one photo take the one closest to the element's shape
-function variantFor(base, ar) {
-  const list = VARIANTS.get(base);
+function variantFor(base, ar) {  const list = VARIANTS.get(base);
   if (!list || !list.length) return null;
   let best = null;
   let bestDiff = Infinity;
@@ -128,7 +171,7 @@ function replace(img) {
 
   prepare(img);
   img.dataset.couplex = '1';
-  img.src = chrome.runtime.getURL('images/' + picked.item.n);
+  img.src = CDN + picked.item.n;
   img.style.objectFit = 'cover';
   img.style.objectPosition = picked.pos;
 
@@ -203,13 +246,21 @@ async function load() {
   if (!opts.enabled) return;
 
   try {
-    const res = await fetch(chrome.runtime.getURL('images/index.json'));
+    const res = await fetch(CDN + 'index.json', { cache: 'force-cache' });
     const data = await res.json();
     IMAGES = Array.isArray(data) ? data.map((n) => ({ n, w: 0, h: 0, f: null, b: n })) : data.images;
   } catch (e) {
     IMAGES = [];
   }
   if (!IMAGES || !IMAGES.length) return;
+
+  // photos added to the data branch after index.json was built
+  try {
+    const extra = await cdnFiles();
+    mergeScanned(extra);
+  } catch (e) {
+    /* the worker may be asleep or blocked, the generated set still works */
+  }
 
   VARIANTS.clear();
   BASES = [];
