@@ -184,8 +184,20 @@ function replace(img) {
 
   // the box may resize once the new image is decoded — recompute then
   img.addEventListener('load', () => {
+    if (!img.isConnected) return;
     const r = img.getBoundingClientRect();
-    const p = place(picked.item, Math.round(r.width) || bw, Math.round(r.height) || bh);
+    let nw = Math.round(r.width) || bw;
+    let nh = Math.round(r.height) || bh;
+    // small icons (avatars, favicons) have no CSS size of their own and would
+    // blow up to the full natural size of the photo — pin them to the old box
+    if (bw && bh && (nw > bw * 1.25 || nh > bh * 1.25)) {
+      img.style.width = `${bw}px`;
+      img.style.height = `${bh}px`;
+      img.style.maxWidth = '100%';
+      nw = bw;
+      nh = bh;
+    }
+    const p = place(picked.item, nw, nh);
     img.style.objectPosition = p.pos;
   }, { once: true });
 
@@ -228,23 +240,69 @@ function start() {
 
   runBatch(all, opts.imagePercent / 100);
 
-  // catch images that arrive later (lazy-load, infinite feeds, SPAs)
+  // images that arrive later (lazy-load, infinite feeds, SPAs) and images whose
+  // src is swapped in place (virtualised feeds like YouTube) — both count
+  const pending = new Set();
+  let scheduled = false;
+
+  const flush = () => {
+    scheduled = false;
+    const list = [...pending].filter(
+      (img) => img.isConnected && img.dataset.couplex !== '1' && img.src
+    );
+    pending.clear();
+    if (!list.length) return;
+    candidates += list.length;
+    for (const img of list) {
+      const mark = img.currentSrc || img.src;
+      if (img.dataset.couplexSkip === mark) continue; // already lost its roll
+      if (Math.random() * 100 < opts.imagePercent) replace(img);
+      else img.dataset.couplexSkip = mark;
+    }
+  };
+
+  const queue = (img) => {
+    if (!img || img.tagName !== 'IMG' || img.dataset.couplex === '1') return;
+    pending.add(img);
+    if (scheduled) return;
+    scheduled = true;
+    setTimeout(flush, 150);
+  };
+
   const mo = new MutationObserver((muts) => {
-    const fresh = [];
     for (const m of muts) {
+      if (m.type === 'attributes') {
+        queue(m.target);
+        continue;
+      }
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
-        if (node.tagName === 'IMG') fresh.push(node);
-        else if (node.querySelectorAll) fresh.push(...node.querySelectorAll('img'));
+        if (node.tagName === 'IMG') queue(node);
+        else if (node.querySelectorAll) node.querySelectorAll('img').forEach(queue);
       }
     }
-    if (!fresh.length) return;
-    // new images get the same share, each one rolled separately
-    for (const img of fresh) {
-      if (Math.random() * 100 < opts.imagePercent) replace(img);
-    }
   });
-  mo.observe(document.documentElement, { childList: true, subtree: true });
+  mo.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['src', 'srcset']
+  });
+
+  // safety net: some feeds reuse nodes and never fire a mutation we can see
+  setInterval(() => {
+    let n = 0;
+    for (const img of document.images) {
+      if (n >= 40) break;
+      if (img.dataset.couplex === '1' || !img.src) continue;
+      const mark = img.currentSrc || img.src;
+      if (img.dataset.couplexSkip === mark) continue;
+      const r = img.getBoundingClientRect();
+      if (r.width < 16 || r.height < 16) continue; // offscreen or lazy placeholder
+      queue(img);
+      n += 1;
+    }
+  }, 2000);
 }
 
 async function load() {
