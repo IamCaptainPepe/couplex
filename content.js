@@ -178,6 +178,10 @@ function replace(img) {
   const bw = Math.round(rect.width) || img.clientWidth || 0;
   const bh = Math.round(rect.height) || img.clientHeight || 0;
 
+  // the element has no layout yet (hidden menu, lazy node): swapping now would
+  // let the photo define the size and blow the page up. Try again later.
+  if (!bw || !bh) return;
+
   const picked = choose(bw, bh);
   if (!picked) return;
 
@@ -202,10 +206,12 @@ function replace(img) {
     let nh = Math.round(r.height) || bh;
     // small icons (avatars, favicons) have no CSS size of their own and would
     // blow up to the full natural size of the photo — pin them to the old box
-    if (bw && bh && (nw > bw * 1.25 || nh > bh * 1.25)) {
+    const small = Math.max(bw, bh) < 320;
+    if (small || nw > bw * 1.25 || nh > bh * 1.25) {
       img.style.width = `${bw}px`;
       img.style.height = `${bh}px`;
-      img.style.maxWidth = '100%';
+      img.style.maxWidth = `${bw}px`;
+      img.style.maxHeight = `${bh}px`;
       nw = bw;
       nh = bh;
     }
