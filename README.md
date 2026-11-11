@@ -1,94 +1,89 @@
 # Couplex
 
-A Chrome / Edge / Firefox extension that replaces images on web pages with photos of Alex Cooper.
-Inspired by [nCage](https://github.com/Fortyseven/nCage), which swapped every image for a picture of Nicolas Cage.
+A Chrome / Edge / Firefox extension that replaces the images on every web page
+with photos of Alex Cooper. Inspired by [nCage](https://github.com/Fortyseven/nCage),
+but instead of Nicolas Cage the whole internet turns into Alex.
+
+The extension itself is tiny (~50 KB). The photo set lives on a CDN, so the
+extension can grow to thousands of photos without getting any heavier.
 
 ## What it does
 
-- When a page loads, it rolls the dice once: **page chance** (40% by default).
-- If the page wins the roll, it replaces a **share of the images** (35% by default) — picked at random, not every Nth one.
-- Images smaller than the **minimum size** (64 px by default) are left alone, so tiny icons don't turn into mush.
-- Images that arrive later are handled too — lazy loading, infinite feeds, single-page apps.
-- Every photo ships in three shapes (square, landscape 3:2, portrait 2:3). The extension picks the crop that matches the slot on the page and positions it so the face and the top of the head stay in frame.
+- Walks all `<img>` elements on the page (and any loaded later) and swaps a
+  random share of them for a random photo of Alex.
+- Three sliders: **page chance** (whether this page gets processed at all),
+  **images to replace** (percentage of images), **minimum size**.
+- Never shows the same photo twice on one page.
+- Picks the crop that fits the slot: square, landscape or portrait.
+- Places the photo by the head box, not by the centre, so faces are never cut.
 
-The toggles live in the popup on the toolbar icon. Settings apply after you reload the page.
+## Install
 
-## Install in Chrome
+### Chrome / Edge
 
-1. Download this repository — **Code → Download ZIP** and unpack it, or `git clone`.
-2. Open `chrome://extensions`.
-3. Turn on **Developer mode** (top-right switch).
-4. Click **Load unpacked** and pick the `couplex` folder.
-5. The icon appears in the toolbar — open any site.
+1. Download this repository (Code → Download ZIP) and unpack it.
+2. Open `chrome://extensions` (or `edge://extensions`).
+3. Turn on **Developer mode**.
+4. Click **Load unpacked** and pick the repository folder.
 
-## Install in Edge
-
-Same steps: `edge://extensions` → **Developer mode** → **Load unpacked**.
-
-## Install in Firefox
+### Firefox
 
 1. Open `about:debugging#/runtime/this-firefox`.
-2. Click **Load Temporary Add-on**.
-3. Pick `couplex/manifest.json`.
+2. **Load Temporary Add-on** and pick `manifest.json`.
 
-In Firefox the extension lives until the browser restarts — that is a limit of temporary add-ons, not of the extension itself.
+## How the photo set works
+
+Photos are **not** shipped inside the extension. They are served from jsDelivr:
+
+```
+https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@data/images/
+```
+
+- `index.json` — the list of photos with face coordinates and dimensions.
+- `*_sq.avif`, `*_l.avif`, `*_p.avif` — three crops of the same photo.
+
+The `data` branch of this repository holds only `images/`. The `master` branch
+holds only the extension code. New photos are picked up automatically: the
+extension asks the jsDelivr file API once every 6 hours and merges any file that
+is not in `index.json` yet (those use a centre crop).
 
 ## Adding photos
 
-Photos live in `images/` as WebP, and the list is `images/index.json`.
-
 ```bash
-# from a folder of PNG/JPG files
-python3 tools/build_images.py /path/to/photos
+# 1. put new source images (png/jpg) into a folder, e.g. _src2/
+# 2. build crops for the new files only
+python3 tools/build_images.py _src2 --max 768 --quality 52 --format avif --speed 6 --incremental
+
+# 3. publish the data branch
+git checkout data
+git add images
+git commit -m "data: new photos"
+git push origin data
 ```
 
-The script needs Pillow and insightface, because it detects the face in every photo and makes three head-centred crops. To install them:
+`build_images.py` finds the face with insightface (`buffalo_l`), crops the photo
+three ways around the head box, encodes to AVIF and rewrites `images/index.json`.
 
-```bash
-pip install pillow insightface onnxruntime
-```
+## Files
 
-Each source photo becomes three files:
-
-- `<name>_sq.webp` — 1:1
-- `<name>_l.webp` — 3:2 landscape
-- `<name>_p.webp` — 2:3 portrait
-
-`images/index.json` stores the pixel size of each crop and the face box as fractions of the frame:
-
-```json
-{"version": 3, "images": [{"n": "m001_sq.webp", "w": 1024, "h": 1024, "f": [0.2752, 0.0487, 0.1038, 0.1403], "b": "m001"}]}
-```
-
-### Adding more photos to a published build
-
-1. Drop the new source files into a folder.
-2. Run the script on that folder.
-3. Bump `version` in `manifest.json` (for example `0.1.0` → `0.1.1`).
-4. Commit and push.
-
-Existing installs pick up the new photos after the browser updates the unpacked folder — or simply reload the extension on `chrome://extensions`.
-
-## How it works
-
-| File | Role |
+| file | role |
 | --- | --- |
-| `manifest.json` | Manifest V3, `<all_urls>` host permission, content script at `document_idle` |
-| `content.js` | rolls the page, picks images, swaps the sources, keeps the face in frame |
-| `popup.html`, `popup.js`, `popup.css` | the three sliders, the on/off switch and the counters |
-| `images/` | the photo set: three crops per photo plus `index.json` |
-| `tools/build_images.py` | builds `images/` from a folder of originals |
-| `icons/` | toolbar icons |
-
-The content script rewrites `img.src` to a `chrome-extension://` URL and removes `srcset`, `sizes` and any `<source>` inside a `<picture>` element, because those would otherwise override the swap. Images already replaced are marked with `data-couplex="1"`, so a second pass never touches them.
+| `manifest.json` | MV3 manifest, no background worker needed |
+| `content.js` | page scanner, CDN loader, placement logic |
+| `popup.html` / `popup.js` | settings UI |
+| `worker.js` | unused leftover, safe to delete |
+| `tools/build_images.py` | photo set builder |
+| `icons/` | extension icons |
 
 ## Privacy
 
-The extension makes no network requests. Everything it shows ships inside the package; the only local read is `images/index.json` and the browser's own `storage.sync` for the settings.
+The extension makes exactly two kinds of network requests, both to jsDelivr:
+the photo index and the photos themselves. No analytics, no tracking, nothing
+is sent about the pages you visit.
 
 ## Limitations
 
-- `canvas`, CSS background images and `<video>` posters are not replaced.
-- Slots with extreme proportions (5:1 and wider) are skipped — only a strip of a person would be left.
-- Chrome Web Store review does not accept extensions that replace other people's pictures on every site, so this is distributed as an unpacked build.
-- The photos are generated images of one person; use them for personal fun, not to impersonate anybody.
+- Canvas, CSS backgrounds and video are not touched — only `<img>` elements.
+- Very wide or very tall slots (wider than 5:1) are skipped, the crops do not fit.
+- Photos are fetched from the internet, so offline pages stay untouched.
+- A face swap like this is for fun; do not use it to impersonate anyone.
