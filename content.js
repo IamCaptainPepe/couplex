@@ -64,7 +64,8 @@ try {
 function showVeil() {
   if (veilEl) return;
   veilEl = document.createElement('style');
-  veilEl.textContent = 'img:not([data-couplex-ready="1"]):not([data-couplex-skip]){visibility:hidden !important}';
+  // SVG wordmarks stay visible. Swapping one for a photo removes the site logo.
+  veilEl.textContent = 'img:not([data-couplex-ready="1"]):not([data-couplex-skip]):not([src$=".svg" i]){visibility:hidden !important}';
   (document.head || document.documentElement).appendChild(veilEl);
 }
 function hideVeil() {
@@ -73,6 +74,7 @@ function hideVeil() {
   veilEl = null;
 }
 try { showVeil(); } catch (e) { /* parsing has not created the document element yet */ }
+try { watchChrome(); } catch (e) { /* document element is not there yet */ }
 
 function pinned(sha) {
   return `https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@${sha}/images/`;
@@ -149,6 +151,93 @@ function extreme(bw, bh) {
 
 function tooSmall(bw, bh) {
   return Math.min(bw, bh) < opts.minSize;
+}
+
+// Wide short slots are wordmarks (the Daily Mail logo is 331x68, just under 5:1).
+function wordmark(bw, bh) {
+  if (!bw || !bh) return false;
+  const ar = bw / bh;
+  if (bh <= 96 && ar >= 3) return true;
+  if (bw <= 96 && bh / bw >= 3 && bh <= 220) return true;
+  return false;
+}
+
+function isSvgUrl(url) {
+  const s = (url || '').split('?')[0].split('#')[0].trim().toLowerCase();
+  return s.endsWith('.svg') || s.startsWith('data:image/svg');
+}
+
+// Logos, icons, header chrome and video players stay as the site drew them.
+function leaveAlone(img) {
+  if (!img || img.tagName !== 'IMG') return false;
+  const src = img.getAttribute('src') || '';
+  if (isSvgUrl(src) || isSvgUrl(img.currentSrc || '')) return true;
+  const hint = `${img.className || ''} ${img.id || ''} ${src}`;
+  if (/logo|icon(?!ic)|sprite|masthead|favicon|badge/i.test(hint)) return true;
+  if (img.closest('header, nav, footer, [role="banner"], [role="navigation"], [role="contentinfo"], #sticky-nav, #page-header, [data-mol-fe-xpmodule-navigation], [data-mol-fe-xpmodule-footer], .mol-video, .vjs-video-container, video')) {
+    return true;
+  }
+  return false;
+}
+
+// A fixed layer that covers the screen is a popup, not an article photo.
+function poppedOver(img) {
+  const vw = window.innerWidth || 1;
+  const vh = window.innerHeight || 1;
+  let el = img;
+  while (el && el !== document.documentElement) {
+    let pos = 'static';
+    try { pos = getComputedStyle(el).position; } catch (e) { break; }
+    if (pos === 'fixed' || pos === 'sticky') {
+      const r = el.getBoundingClientRect();
+      if (r.width >= vw * 0.82 && r.height >= vh * 0.72) return true;
+    }
+    el = el.parentElement;
+  }
+  return false;
+}
+
+// Daily Mail only keeps a vertical video inline when the container carries
+// data-portrait-2x3-plugin. Without it the player pins itself over the page on scroll.
+function tamePortraitVideos(root) {
+  if (!root) return;
+  const list = [];
+  if (root.tagName === 'VIDEO') list.push(root);
+  if (root.querySelectorAll) root.querySelectorAll('video').forEach((video) => list.push(video));
+  for (const video of list) {
+    const optsAttr = video.getAttribute('data-opts') || '';
+    if (!/"orientation"\s*:\s*"vertical"|"portrait-2x3"/i.test(optsAttr)) continue;
+    const box = video.closest('.vjs-video-container') || video.parentElement;
+    if (box && !box.hasAttribute('data-portrait-2x3-plugin')) {
+      box.setAttribute('data-portrait-2x3-plugin', '');
+    }
+  }
+}
+
+function revealChrome(root) {
+  if (!root) return;
+  const list = [];
+  if (root.tagName === 'IMG') list.push(root);
+  if (root.querySelectorAll) root.querySelectorAll('img').forEach((img) => list.push(img));
+  for (const img of list) {
+    if (leaveAlone(img) && !img.dataset.couplexSkip) markSkip(img);
+  }
+}
+
+function watchChrome() {
+  const scan = (root) => {
+    tamePortraitVideos(root);
+    revealChrome(root);
+  };
+  scan(document);
+  const mo = new MutationObserver((muts) => {
+    for (const m of muts) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType === 1) scan(node);
+      }
+    }
+  });
+  mo.observe(document.documentElement || document, { childList: true, subtree: true });
 }
 
 function inViewport(img) {
@@ -583,10 +672,16 @@ function armIconCheck(img) {
       stop();
       return;
     }
+    if (leaveAlone(img) || poppedOver(img)) {
+      const state = SWAP.get(img);
+      restore(img, state && state.base);
+      stop();
+      return;
+    }
     const { bw, bh } = boxOf(img);
     if (!bw || !bh) return;
     stop();
-    if (tooSmall(bw, bh) || extreme(bw, bh)) {
+    if (!hasLazy(img) && (tooSmall(bw, bh) || extreme(bw, bh) || wordmark(bw, bh))) {
       const state = SWAP.get(img);
       restore(img, state && state.base);
     }
@@ -602,8 +697,12 @@ function armIconCheck(img) {
 function swap(img) {
   if (!opts.enabled || !pageAgreed || !img.isConnected || img.dataset.couplex === '1') return;
   if (!IMAGES.length) return;
+  if (leaveAlone(img)) {
+    markSkip(img);
+    return;
+  }
   const slot = slotOf(img);
-  if (slot.bw && slot.bh && extreme(slot.bw, slot.bh)) {
+  if (slot.bw && slot.bh && (extreme(slot.bw, slot.bh) || wordmark(slot.bw, slot.bh))) {
     markSkip(img);
     return;
   }
@@ -656,11 +755,15 @@ function consider(img) {
     return;
   }
   if (isOurUrl(cur)) return;
+  if (leaveAlone(img)) {
+    markSkip(img);
+    return;
+  }
   const mark = stableMark(img) || '1';
   if (img.dataset.couplexSkip === mark) return;
 
   const slot = slotOf(img);
-  if (slot.bw && slot.bh && extreme(slot.bw, slot.bh)) {
+  if (slot.bw && slot.bh && (extreme(slot.bw, slot.bh) || wordmark(slot.bw, slot.bh))) {
     markSkip(img);
     return;
   }
@@ -744,6 +847,8 @@ function installObserver() {
       }
       for (const node of m.addedNodes) {
         if (node.nodeType !== 1) continue;
+        tamePortraitVideos(node);
+        revealChrome(node);
         if (node.tagName === 'IMG') queue(node);
         else if (node.querySelectorAll) node.querySelectorAll('img').forEach(queue);
       }
@@ -761,6 +866,8 @@ function start() {
   if (started) return;
   started = true;
   installObserver();
+  tamePortraitVideos(document);
+  revealChrome(document);
 
   const soon = [];
   const rest = [];
@@ -773,8 +880,12 @@ function start() {
       markSkip(img);
       continue;
     }
+    if (leaveAlone(img)) {
+      markSkip(img);
+      continue;
+    }
     const slot = slotOf(img);
-    if (slot.bw && slot.bh && (extreme(slot.bw, slot.bh) || (tooSmall(slot.bw, slot.bh) && !hasLazy(img)))) {
+    if (slot.bw && slot.bh && (extreme(slot.bw, slot.bh) || wordmark(slot.bw, slot.bh) || (tooSmall(slot.bw, slot.bh) && !hasLazy(img)))) {
       markSkip(img);
       continue;
     }
@@ -949,4 +1060,4 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 load().catch(() => { if (!pageAgreed) hideVeil(); });
 
-// Done on CyOps: iconic shots (i, k) deal a little more often, press covers less often, Janitor Oil about once every 22 photos.
+// Done on CyOps: iconic shots (i, k) deal a little more often, press covers less often, Janitor Oil about once every 22 photos. Logos and vertical video players stay as the site drew them.

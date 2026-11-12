@@ -82,7 +82,7 @@ tracking, nothing is sent about the pages you visit.
 
 ## Limitations
 
-- Canvas, CSS backgrounds and video are not touched — only `<img>` elements.
+- Canvas, CSS backgrounds and video are not touched — only `<img>` elements. Logos, icons and the site header are left alone. A vertical Daily Mail video stays in the article instead of pinning itself over the page.
 - Very wide or very tall slots (wider than 5:1) are skipped, the crops do not fit.
 - Photos are fetched from the internet, so offline pages stay untouched.
 - A face swap like this is for fun; do not use it to impersonate anyone.
