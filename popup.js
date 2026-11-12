@@ -1,6 +1,17 @@
 // Couplex popup — three sliders + live counters.
 
-const DEFAULTS = { enabled: true, pageChance: 40, imagePercent: 35, minSize: 64 };
+const DEFAULTS = { enabled: true, pageChance: 100, imagePercent: 100, minSize: 64, v: 3 };
+
+function normalize(raw) {
+  const o = { ...DEFAULTS, ...(raw || {}) };
+  const fresh = !raw || raw.v !== 3;
+  if (fresh && (!raw || (Number(raw.pageChance) === 40 && Number(raw.imagePercent) === 35))) {
+    o.pageChance = 100;
+    o.imagePercent = 100;
+  }
+  if (fresh) o.v = 3;
+  return { opts: o, migrated: fresh };
+}
 const KEY = 'couplexOptions';
 
 const el = (id) => document.getElementById(id);
@@ -50,8 +61,9 @@ for (const control of Object.values(controls)) {
 
 async function init() {
   const stored = await chrome.storage.sync.get({ [KEY]: DEFAULTS });
-  const opts = { ...DEFAULTS, ...stored[KEY] };
-  paint(opts);
+  const norm = normalize(stored[KEY]);
+  if (norm.migrated) chrome.storage.sync.set({ [KEY]: norm.opts });
+  paint(norm.opts);
 
   try {
     const res = await fetch(chrome.runtime.getURL('images/index.json'));

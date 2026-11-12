@@ -89,4 +89,4 @@ tracking, nothing is sent about the pages you visit.
 
 ## Done on CyOps
 
-Visible images are swapped immediately from the cached commit. The rest swap when they approach the viewport. If the CDN photo fails to load, the original image is restored.
+Every eligible image is replaced by default. The original stays hidden until the new photo has loaded, including images that lazy-load while you scroll. Photos are dealt from a shuffled deck, so the same picture is not repeated until the whole set has been used. Janitor Oil ads are left out. If the CDN photo fails to load, the original image is restored.

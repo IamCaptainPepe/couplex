@@ -6,9 +6,10 @@
 
 const DEFAULTS = {
   enabled: true,
-  pageChance: 40,   // odds that this page gets any replacement at all, %
-  imagePercent: 35, // share of images on a winning page to replace, %
-  minSize: 64       // smaller images are left alone, px
+  pageChance: 100,  // odds that this page gets any replacement at all, %
+  imagePercent: 100, // share of images on a winning page to replace, %
+  minSize: 64,      // smaller images are left alone, px
+  v: 3
 };
 
 const KEY = 'couplexOptions';
@@ -20,6 +21,15 @@ const USED = new Set();
 const SAVED = new WeakMap();
 const SWAP = new WeakMap();
 const SIZE_WAIT = new WeakMap();
+const LAZY_ATTRS = [
+  'data-src', 'data-srcset', 'data-lazy-src', 'data-lazy',
+  'data-original', 'data-original-src', 'data-image', 'data-img-url', 'data-hi-res-src'
+];
+
+let deck = [];
+let deckPos = 0;
+let lastPicked = '';
+let veilEl = null;
 
 let replaced = 0;
 let candidates = 0;
@@ -49,6 +59,21 @@ try {
   /* document is empty this early, the first request will pay the handshake */
 }
 
+// Hide every img until our photo has decoded, or until we decide to leave it.
+// Injected at document_start so the original never paints on a slow swap.
+function showVeil() {
+  if (veilEl) return;
+  veilEl = document.createElement('style');
+  veilEl.textContent = 'img:not([data-couplex-ready="1"]):not([data-couplex-skip]){visibility:hidden !important}';
+  (document.head || document.documentElement).appendChild(veilEl);
+}
+function hideVeil() {
+  if (!veilEl) return;
+  veilEl.remove();
+  veilEl = null;
+}
+try { showVeil(); } catch (e) { /* parsing has not created the document element yet */ }
+
 function pinned(sha) {
   return `https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@${sha}/images/`;
 }
@@ -73,8 +98,39 @@ function stableMark(img) {
   return mark;
 }
 
+function hasLazy(img) {
+  return LAZY_ATTRS.some((name) => img.hasAttribute(name));
+}
+
 function hasAddress(img) {
-  return !!(img.getAttribute('src') || img.getAttribute('srcset'));
+  return !!(img.getAttribute('src') || img.getAttribute('srcset') || hasLazy(img));
+}
+
+function normalize(raw) {
+  const o = { ...DEFAULTS, ...(raw || {}) };
+  const fresh = !raw || raw.v !== 3;
+  if (fresh && (!raw || (Number(raw.pageChance) === 40 && Number(raw.imagePercent) === 35))) {
+    o.pageChance = 100;
+    o.imagePercent = 100;
+  }
+  if (fresh) o.v = 3;
+  return { opts: o, migrated: fresh };
+}
+
+function slotOf(img) {
+  const live = boxOf(img);
+  if (live.bw && live.bh) return { bw: live.bw, bh: live.bh, guessed: false };
+  const w = Number(img.getAttribute('width')) || 0;
+  const h = Number(img.getAttribute('height')) || 0;
+  if (w && h) return { bw: w, bh: h, guessed: true };
+  return { bw: 0, bh: 0, guessed: true };
+}
+
+function isHot(img) {
+  const r = img.getBoundingClientRect();
+  const vh = window.innerHeight || 800;
+  if (r.width < 1 && r.height < 1) return true;
+  return r.bottom > -vh * 0.4 && r.top < vh * 2.5;
 }
 
 function boxOf(img) {
@@ -152,7 +208,8 @@ function remember(img) {
     sizes: img.getAttribute('sizes'),
     loading: img.getAttribute('loading'),
     sources,
-    style: styleSnapshot(img)
+    style: styleSnapshot(img),
+    lazy: LAZY_ATTRS.filter((name) => img.hasAttribute(name)).map((name) => [name, img.getAttribute(name)])
   });
 }
 
@@ -161,6 +218,7 @@ function stripSources(img) {
   if (pic) pic.querySelectorAll('source').forEach((s) => s.remove());
   img.removeAttribute('srcset');
   img.removeAttribute('sizes');
+  for (const name of LAZY_ATTRS) img.removeAttribute(name);
   img.decoding = 'async';
 }
 
@@ -180,6 +238,8 @@ function restore(img, base) {
   delete img.dataset.couplexName;
   delete img.dataset.couplexRoll;
   delete img.dataset.couplexWon;
+  delete img.dataset.couplexReady;
+  delete img.dataset.couplexFights;
   img.dataset.couplexSkip = isDataOrBlob(mark) ? 'embedded' : mark;
   applyStyle(img, saved && saved.style);
   if (base) USED.delete(base);
@@ -194,6 +254,7 @@ function restore(img, base) {
   setAttr(img, 'srcset', saved.srcset);
   setAttr(img, 'sizes', saved.sizes);
   setAttr(img, 'loading', saved.loading);
+  for (const pair of saved.lazy || []) setAttr(img, pair[0], pair[1]);
 }
 
 function releaseForReroll(img) {
@@ -208,6 +269,8 @@ function releaseForReroll(img) {
   delete img.dataset.couplexSkip;
   delete img.dataset.couplexRoll;
   delete img.dataset.couplexWon;
+  delete img.dataset.couplexReady;
+  delete img.dataset.couplexFights;
   applyStyle(img, SAVED.get(img) && SAVED.get(img).style);
   noteRemoved();
 }
@@ -262,31 +325,38 @@ function variantFor(base, ar) {
   return best;
 }
 
-// Pick a photo that fits the element's aspect ratio. Each photo has square,
-// landscape and portrait crops, so the head has room. Never the same photo
-// twice until the set is exhausted.
+// One shuffled pass through the whole set. The same photo is not shown again
+// until every other photo has been used, and the new pass does not open with
+// the photo that just closed the previous one.
+function nextBase() {
+  if (!BASES.length) return null;
+  if (deckPos >= deck.length) {
+    deck = shuffle(BASES.slice());
+    deckPos = 0;
+    if (lastPicked && deck.length > 1 && deck[0] === lastPicked) {
+      const j = 1 + Math.floor(Math.random() * (deck.length - 1));
+      const first = deck[0];
+      deck[0] = deck[j];
+      deck[j] = first;
+    }
+  }
+  const base = deck[deckPos];
+  deckPos += 1;
+  lastPicked = base;
+  return base;
+}
+
 function choose(bw, bh) {
   if (!BASES.length) return null;
-  const ar = bw && bh ? bw / bh : 1;
-  if (extreme(bw, bh)) return null;
-
-  const free = BASES.filter((b) => !USED.has(b));
-  const pool = free.length ? free : BASES;
-  const start = Math.floor(Math.random() * pool.length);
-  let fallback = null;
-  for (let k = 0; k < Math.min(6, pool.length); k += 1) {
-    const base = pool[(start + k) % pool.length];
-    const item = variantFor(base, ar);
-    if (!item) continue;
-    const p = place(item, bw, bh);
-    if (p.fit) {
-      USED.add(base);
-      return { item, pos: p.pos };
-    }
-    if (!fallback) fallback = { item, pos: p.pos };
-  }
-  if (fallback) USED.add(fallback.item.b || fallback.item.n);
-  return fallback;
+  if (bw && bh && extreme(bw, bh)) return null;
+  const ar = bw && bh ? bw / bh : 1.5;
+  const base = nextBase();
+  if (!base) return null;
+  const item = variantFor(base, ar);
+  if (!item) return null;
+  const p = place(item, bw || item.w, bh || item.h);
+  USED.add(base);
+  return { item, pos: p.pos };
 }
 
 function fail(img) {
@@ -312,8 +382,10 @@ function landed(img, item, bw, bh) {
   let nh = Math.round(r.height) || bh;
   // small slots have no CSS size of their own and would jump to the photo's
   // natural size — pin them to the box we measured before the swap
-  const small = Math.max(bw, bh) < 320;
-  if (small || nw > bw * 1.25 || nh > bh * 1.25) {
+  // Only pin genuinely small slots. Locking a hero to an early box and then
+  // stretching that box is what makes the 768px photo look soft.
+  const small = bw && bh && Math.max(bw, bh) < 320;
+  if (small) {
     img.style.width = `${bw}px`;
     img.style.height = `${bh}px`;
     img.style.maxWidth = `${bw}px`;
@@ -321,31 +393,57 @@ function landed(img, item, bw, bh) {
     nw = bw;
     nh = bh;
   }
-  img.style.objectPosition = place(item, nw, nh).pos;
+  img.style.objectPosition = place(item, nw || item.w, nh || item.h).pos;
+  img.dataset.couplexReady = '1';
 }
 
-function swap(img, visible) {
+function armIconCheck(img) {
+  if (SIZE_WAIT.has(img) || hasLazy(img)) return;
+  let ro = null;
+  const stop = () => {
+    SIZE_WAIT.delete(img);
+    if (ro) ro.disconnect();
+  };
+  const kick = () => {
+    if (!img.isConnected || img.dataset.couplex !== '1') {
+      stop();
+      return;
+    }
+    const { bw, bh } = boxOf(img);
+    if (!bw || !bh) return;
+    stop();
+    if (tooSmall(bw, bh) || extreme(bw, bh)) {
+      const state = SWAP.get(img);
+      restore(img, state && state.base);
+    }
+  };
+  if (window.ResizeObserver) {
+    ro = new ResizeObserver(kick);
+    ro.observe(img);
+  }
+  setTimeout(kick, 400);
+  SIZE_WAIT.set(img, stop);
+}
+
+function swap(img) {
   if (!opts.enabled || !pageAgreed || !img.isConnected || img.dataset.couplex === '1') return;
   if (!IMAGES.length) return;
-  if (io) io.unobserve(img);
-  const { bw, bh } = boxOf(img);
-  if (!bw || !bh) {
-    armSizeRetry(img);
-    return;
-  }
-  if (extreme(bw, bh) || (tooSmall(bw, bh) && img.naturalWidth)) {
+  const slot = slotOf(img);
+  if (slot.bw && slot.bh && extreme(slot.bw, slot.bh)) {
     markSkip(img);
     return;
   }
-  if (tooSmall(bw, bh)) {
-    armSizeRetry(img);
+  if (slot.bw && slot.bh && tooSmall(slot.bw, slot.bh) && !hasLazy(img)) {
+    markSkip(img);
     return;
   }
-  const picked = choose(bw, bh);
+  const picked = choose(slot.bw, slot.bh);
   if (!picked) {
     markSkip(img);
     return;
   }
+  const hot = isHot(img);
+  const { bw, bh } = slot;
 
   remember(img);
   stripSources(img);
@@ -360,75 +458,18 @@ function swap(img, visible) {
   img.dataset.couplex = '1';
   img.dataset.couplexName = name;
   img.dataset.couplexUrl = url;
+  delete img.dataset.couplexReady;
   img.decoding = 'async';
-  img.loading = visible ? 'eager' : 'lazy';
+  img.loading = 'eager';
   img.referrerPolicy = 'no-referrer';
-  if ('fetchPriority' in img) img.fetchPriority = visible ? 'high' : 'low';
+  if ('fetchPriority' in img) img.fetchPriority = hot ? 'high' : 'low';
   img.style.objectFit = 'cover';
   img.style.objectPosition = picked.pos;
   img.addEventListener('error', () => fail(img), { signal: ac.signal });
   img.addEventListener('load', () => landed(img, picked.item, bw, bh), { signal: ac.signal });
+  if (!slot.bw || slot.guessed) armIconCheck(img);
   replaced += 1;
   img.src = url;
-}
-
-// No layout yet: watch this element only, and only for a short beat.
-// A full-document poll made every page pay for images that never got a box.
-function armSizeRetry(img) {
-  if (SIZE_WAIT.has(img) || img.dataset.couplex === '1') return;
-  let done = false;
-  let ro = null;
-  const timers = [];
-  const stop = () => {
-    if (done) return;
-    done = true;
-    SIZE_WAIT.delete(img);
-    img.removeEventListener('load', kick);
-    if (ro) ro.disconnect();
-    timers.forEach(clearTimeout);
-  };
-  const kick = () => {
-    if (done || !img.isConnected) {
-      stop();
-      return;
-    }
-    const { bw, bh } = boxOf(img);
-    if (!bw || !bh) return;
-    if (tooSmall(bw, bh) && !img.naturalWidth) return;
-    stop();
-    consider(img);
-  };
-  if (window.ResizeObserver) {
-    ro = new ResizeObserver(kick);
-    ro.observe(img);
-  }
-  img.addEventListener('load', kick);
-  timers.push(setTimeout(kick, 80), setTimeout(kick, 200), setTimeout(kick, 360));
-  timers.push(setTimeout(() => {
-    if (done) return;
-    stop();
-    if (!img.isConnected) return;
-    // one wait per address — a still-empty box must not schedule another
-    img.dataset.couplexWaited = stableMark(img) || '1';
-    const { bw, bh } = boxOf(img);
-    if (bw && bh) consider(img);
-  }, 520));
-  SIZE_WAIT.set(img, stop);
-}
-
-let io = null;
-function watchOffscreen(img) {
-  if (!img.isConnected || img.dataset.couplex === '1') return;
-  if (!io) {
-    io = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        io.unobserve(entry.target);
-        swap(entry.target, true);
-      }
-    }, { rootMargin: '200px' });
-  }
-  io.observe(img);
 }
 
 function consider(img) {
@@ -436,33 +477,26 @@ function consider(img) {
   if (!hasAddress(img)) return;
   const attrSrc = (img.getAttribute('src') || '').trim();
   const cur = img.currentSrc || img.src || '';
-  if (isDataOrBlob(attrSrc) || isDataOrBlob(cur)) {
+  if ((isDataOrBlob(attrSrc) || isDataOrBlob(cur)) && !hasLazy(img) && !img.getAttribute('srcset')) {
     markSkip(img);
     return;
   }
   if (isOurUrl(cur)) return;
-  const mark = stableMark(img);
-  if (img.dataset.couplexSkip && img.dataset.couplexSkip === (mark || '1')) return;
+  const mark = stableMark(img) || '1';
+  if (img.dataset.couplexSkip === mark) return;
 
-  const { bw, bh } = boxOf(img);
-  if (!bw || !bh) {
-    armSizeRetry(img);
-    return;
-  }
-  if (extreme(bw, bh)) {
+  const slot = slotOf(img);
+  if (slot.bw && slot.bh && extreme(slot.bw, slot.bh)) {
     markSkip(img);
     return;
   }
-  if (tooSmall(bw, bh)) {
-    const waited = img.dataset.couplexWaited === (stableMark(img) || '1');
-    if (!img.naturalWidth && !waited) armSizeRetry(img);
-    else markSkip(img);
+  if (slot.bw && slot.bh && tooSmall(slot.bw, slot.bh) && !hasLazy(img)) {
+    markSkip(img);
     return;
   }
 
-  const token = stableMark(img);
-  if (img.dataset.couplexRoll !== token) {
-    img.dataset.couplexRoll = token;
+  if (img.dataset.couplexRoll !== mark) {
+    img.dataset.couplexRoll = mark;
     img.dataset.couplexWon = Math.random() * 100 < opts.imagePercent ? '1' : '0';
     candidates += 1;
   }
@@ -470,8 +504,7 @@ function consider(img) {
     markSkip(img);
     return;
   }
-  if (inViewport(img)) swap(img, true);
-  else watchOffscreen(img);
+  swap(img);
 }
 
 const pending = new Set();
@@ -481,13 +514,24 @@ function queue(img) {
   pending.add(img);
   if (scheduled) return;
   scheduled = true;
-  requestAnimationFrame(flush);
+  queueMicrotask(flush);
 }
 function flush() {
   scheduled = false;
   const list = [...pending];
   pending.clear();
+  list.sort((a, b) => Number(isHot(b)) - Number(isHot(a)));
   for (const img of list) consider(img);
+}
+
+function holdOurs(img) {
+  const keep = img.dataset.couplexUrl;
+  if (!keep) return false;
+  const n = Number(img.dataset.couplexFights || '0') + 1;
+  if (n > 6) return false;
+  img.dataset.couplexFights = String(n);
+  img.src = keep;
+  return true;
 }
 
 function onAttr(img) {
@@ -495,12 +539,14 @@ function onAttr(img) {
   const src = img.currentSrc || img.src || '';
   if (img.dataset.couplex === '1') {
     if (isOurUrl(src)) return;
-    // the page reused this element and pointed it at a new file
+    // lazyload and virtualized feeds rewrite src after we do; keep ours so
+    // the original does not flash in while the next photo downloads
+    if (holdOurs(img)) return;
     releaseForReroll(img);
     queue(img);
     return;
   }
-  if (isDataOrBlob((img.getAttribute('src') || '').trim()) || isDataOrBlob(src)) {
+  if ((isDataOrBlob((img.getAttribute('src') || '').trim()) || isDataOrBlob(src)) && !hasLazy(img)) {
     markSkip(img);
     return;
   }
@@ -533,7 +579,7 @@ function installObserver() {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ['src', 'srcset']
+    attributeFilter: ['src', 'srcset'].concat(LAZY_ATTRS)
   });
 }
 
@@ -542,50 +588,39 @@ function start() {
   started = true;
   installObserver();
 
-  const ready = [];
-  const waiting = [];
+  const soon = [];
+  const rest = [];
   for (const img of document.images) {
     if (!hasAddress(img)) continue;
     const attrSrc = (img.getAttribute('src') || '').trim();
     const cur = img.currentSrc || img.src || '';
-    if (isDataOrBlob(attrSrc) || isDataOrBlob(cur) || isOurUrl(cur)) {
-      if (!isOurUrl(cur)) markSkip(img);
-      continue;
-    }
-    const { bw, bh } = boxOf(img);
-    if (!bw || !bh || (tooSmall(bw, bh) && !img.naturalWidth)) {
-      waiting.push(img);
-      continue;
-    }
-    if (extreme(bw, bh) || tooSmall(bw, bh)) {
+    if (isOurUrl(cur)) continue;
+    if ((isDataOrBlob(attrSrc) || isDataOrBlob(cur)) && !hasLazy(img) && !img.getAttribute('srcset')) {
       markSkip(img);
       continue;
     }
-    ready.push(img);
+    const slot = slotOf(img);
+    if (slot.bw && slot.bh && (extreme(slot.bw, slot.bh) || (tooSmall(slot.bw, slot.bh) && !hasLazy(img)))) {
+      markSkip(img);
+      continue;
+    }
+    (isHot(img) ? soon : rest).push(img);
   }
 
+  const ordered = soon.concat(rest);
   const fraction = opts.imagePercent / 100;
-  const n = fraction >= 1 ? ready.length : Math.floor(ready.length * fraction);
-  const visible = [];
-  const hidden = [];
-  for (const img of ready) (inViewport(img) ? visible : hidden).push(img);
-  shuffle(visible);
-  shuffle(hidden);
-  const winners = new Set([...visible, ...hidden].slice(0, n));
-
-  for (const img of ready) {
+  const n = fraction >= 1 ? ordered.length : Math.floor(ordered.length * fraction);
+  const winners = new Set(ordered.slice(0, n));
+  for (const img of ordered) {
     img.dataset.couplexRoll = stableMark(img) || '1';
+    img.dataset.couplexWon = winners.has(img) ? '1' : '0';
     candidates += 1;
     if (!winners.has(img)) {
-      img.dataset.couplexWon = '0';
       markSkip(img);
       continue;
     }
-    img.dataset.couplexWon = '1';
-    if (inViewport(img)) swap(img, true);
-    else watchOffscreen(img);
+    swap(img);
   }
-  for (const img of waiting) armSizeRetry(img);
 }
 
 async function apiSha() {
@@ -621,8 +656,12 @@ function applyIndex(list) {
   IMAGES = list;
   VARIANTS.clear();
   BASES = [];
+  deck = [];
+  deckPos = 0;
   for (const it of IMAGES) {
     const b = it.b || it.n;
+    // j0001… is the Janitor Oil ad series, not a portrait
+    if (/^j\d/i.test(b)) continue;
     if (!VARIANTS.has(b)) {
       VARIANTS.set(b, []);
       BASES.push(b);
@@ -682,8 +721,13 @@ async function refresh() {
 
 async function load() {
   const stored = await chrome.storage.sync.get({ [KEY]: DEFAULTS });
-  opts = { ...DEFAULTS, ...stored[KEY] };
-  if (!opts.enabled) return;
+  const norm = normalize(stored[KEY]);
+  opts = norm.opts;
+  if (norm.migrated) chrome.storage.sync.set({ [KEY]: opts });
+  if (!opts.enabled) {
+    hideVeil();
+    return;
+  }
 
   const got = await lget({ couplexSha: null, couplexIndex: null });
   const sha = (got.couplexSha && got.couplexSha.sha) || '';
@@ -694,21 +738,22 @@ async function load() {
 
   if (!BASES.length) {
     await refresh();
-    if (!BASES.length) return;
+    if (!BASES.length) {
+      hideVeil();
+      return;
+    }
   }
 
   pageAgreed = Math.random() * 100 < opts.pageChance;
   if (!pageAgreed) {
-    // no photo requests on a page that lost the roll; refresh only the index
+    hideVeil();
     refresh().catch(() => {});
     return;
   }
 
-  // one frame: boxes are real, and the swap still lands before the next paint
-  requestAnimationFrame(() => {
-    start();
-    refresh().then(() => warmCache(6)).catch(() => {});
-  });
+  showVeil();
+  start();
+  refresh().then(() => warmCache(8)).catch(() => {});
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -730,7 +775,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-load().catch(() => {});
+load().catch(() => { if (!pageAgreed) hideVeil(); });
 
-// Done on CyOps: visible frames swap immediately from the pinned SHA,
-// and the original is restored if the CDN does not open.
+// Done on CyOps: images stay hidden until the swapped photo loads,
+// and the page walks a shuffled deck so the same photo is not repeated.
