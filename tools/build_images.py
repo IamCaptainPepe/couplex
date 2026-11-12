@@ -135,9 +135,6 @@ def main():
     added = 0
     for i, f in enumerate(files, 1):
         base = os.path.splitext(f)[0].replace("_00001_", "")
-        # j0001… is the Janitor Oil ad series
-        if len(base) > 1 and base[0] in "jJ" and base[1].isdigit():
-            continue
         if base in seen:
             continue
         try:

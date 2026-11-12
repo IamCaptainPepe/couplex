@@ -89,4 +89,4 @@ tracking, nothing is sent about the pages you visit.
 
 ## Done on CyOps
 
-Every eligible image is replaced by default. The original stays hidden until the new photo has loaded, including images that lazy-load while you scroll. Photos are dealt from a shuffled deck, so the same picture is not repeated until the whole set has been used. Janitor Oil ads are left out. If the CDN photo fails to load, the original image is restored.
+Every eligible image is replaced by default. The original stays hidden until the new photo has loaded, including images that lazy-load while you scroll. Photos are dealt by category, so one series does not follow itself, and the same picture is not repeated until the rest of the deck has been used. A Janitor Oil ad shows up about once every 14 photos. If the CDN photo fails to load, the original image is restored.

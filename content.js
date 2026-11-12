@@ -325,21 +325,63 @@ function variantFor(base, ar) {
   return best;
 }
 
-// One shuffled pass through the whole set. The same photo is not shown again
-// until every other photo has been used, and the new pass does not open with
-// the photo that just closed the previous one.
-function nextBase() {
-  if (!BASES.length) return null;
-  if (deckPos >= deck.length) {
-    deck = shuffle(BASES.slice());
+function categoryOf(base) {
+  const m = /^([A-Za-z]+)/.exec(base || '');
+  return m ? m[1].toLowerCase() : '?';
+}
+
+// One oil ad per 14 other photos. Often enough to land the joke, not a run of bottles.
+const OIL_EVERY = 14;
+
+// Categories take turns, so one generation series does not follow itself.
+// The same photo still waits until the rest of the deck has been used.
+function refillDeck() {
+  const groups = new Map();
+  for (const base of BASES) {
+    const cat = categoryOf(base);
+    if (!groups.has(cat)) groups.set(cat, []);
+    groups.get(cat).push(base);
+  }
+  for (const list of groups.values()) shuffle(list);
+
+  const oil = groups.get('j') || [];
+  groups.delete('j');
+  const keys = shuffle([...groups.keys()]);
+  const out = [];
+  let sinceOil = 0;
+  if (!keys.length) {
+    deck = oil;
     deckPos = 0;
-    if (lastPicked && deck.length > 1 && deck[0] === lastPicked) {
-      const j = 1 + Math.floor(Math.random() * (deck.length - 1));
-      const first = deck[0];
-      deck[0] = deck[j];
-      deck[j] = first;
+    return;
+  }
+  while (keys.some((key) => groups.get(key).length)) {
+    for (const key of keys) {
+      const list = groups.get(key);
+      if (!list.length) continue;
+      out.push(list.pop());
+      sinceOil += 1;
+      if (oil.length && sinceOil >= OIL_EVERY) {
+        out.push(oil.pop());
+        sinceOil = 0;
+      }
     }
   }
+  deck = out;
+  deckPos = 0;
+  const prev = categoryOf(lastPicked);
+  if (lastPicked && deck.length > 1 && (deck[0] === lastPicked || categoryOf(deck[0]) === prev)) {
+    const swapAt = deck.findIndex((b, i) => i > 0 && b !== lastPicked && categoryOf(b) !== prev);
+    if (swapAt > 0) {
+      const first = deck[0];
+      deck[0] = deck[swapAt];
+      deck[swapAt] = first;
+    }
+  }
+}
+
+function nextBase() {
+  if (!BASES.length) return null;
+  if (deckPos >= deck.length) refillDeck();
   const base = deck[deckPos];
   deckPos += 1;
   lastPicked = base;
@@ -660,8 +702,6 @@ function applyIndex(list) {
   deckPos = 0;
   for (const it of IMAGES) {
     const b = it.b || it.n;
-    // j0001… is the Janitor Oil ad series, not a portrait
-    if (/^j\d/i.test(b)) continue;
     if (!VARIANTS.has(b)) {
       VARIANTS.set(b, []);
       BASES.push(b);
@@ -777,5 +817,4 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 load().catch(() => { if (!pageAgreed) hideVeil(); });
 
-// Done on CyOps: images stay hidden until the swapped photo loads,
-// and the page walks a shuffled deck so the same photo is not repeated.
+// Done on CyOps: categories take turns, and a Janitor Oil ad appears about once every 14 photos.
