@@ -86,3 +86,7 @@ tracking, nothing is sent about the pages you visit.
 - Very wide or very tall slots (wider than 5:1) are skipped, the crops do not fit.
 - Photos are fetched from the internet, so offline pages stay untouched.
 - A face swap like this is for fun; do not use it to impersonate anyone.
+
+## Сделано на CyOps
+
+Видимые картинки подменяются сразу с закэшированного коммита. Остальные — когда подходят к экрану. Если фото с CDN не открылось, на место возвращается исходная картинка.

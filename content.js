@@ -1,9 +1,8 @@
 // Couplex — replaces images on a page with photos of Alex Cooper.
-// Every page first wins or loses a single roll, then a percentage of the
-// images on a winning page get swapped.
-//
-// Faces are never cut off: index.json stores a face box per photo and
-// object-position is computed so the whole face fits the visible window.
+// The fast path uses the commit and index already in storage. GitHub is
+// asked only after the first swaps, so a page is not blocked on the network.
+// Faces stay in frame: index.json stores a face box and object-position is
+// computed so the whole head fits the visible window.
 
 const DEFAULTS = {
   enabled: true,
@@ -18,13 +17,26 @@ let IMAGES = [];
 let BASES = [];
 const VARIANTS = new Map();
 const USED = new Set();
+const SAVED = new WeakMap();
+const SWAP = new WeakMap();
+const SIZE_WAIT = new WeakMap();
+
 let replaced = 0;
 let candidates = 0;
 let pageAgreed = false;
 let started = false;
 let opts = { ...DEFAULTS };
 
+const RAW_INDEX = 'https://raw.githubusercontent.com/IamCaptainPepe/couplex/data/images/index.json';
+const BRANCH_API = 'https://api.github.com/repos/IamCaptainPepe/couplex/branches/data';
+const CDN_REF = 'https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@data/images/';
+const SHA_TTL = 3600 * 1000;
+const INDEX_TTL = 6 * 3600 * 1000;
+let CDN = CDN_REF;
+
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const lget = (d) => new Promise((r) => chrome.storage.local.get(d, r));
+const lset = (o) => new Promise((r) => chrome.storage.local.set(o, () => r()));
 
 // start the TLS handshake with the photo CDN before anything else happens
 try {
@@ -37,14 +49,167 @@ try {
   /* document is empty this early, the first request will pay the handshake */
 }
 
-function prepare(img) {
-  // <picture><source> overrides src, so drop the sources first
+function pinned(sha) {
+  return `https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@${sha}/images/`;
+}
+
+function isOurUrl(url) {
+  return typeof url === 'string' && url.indexOf('cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@') !== -1;
+}
+
+function isDataOrBlob(url) {
+  const s = (url || '').trim().toLowerCase();
+  return s.startsWith('data:') || s.startsWith('blob:');
+}
+
+function markOf(img) {
+  return img.getAttribute('src') || img.getAttribute('srcset') || '';
+}
+
+// data/blob URLs are huge; the skip flag must not copy them onto the element
+function stableMark(img) {
+  const mark = markOf(img);
+  if (isDataOrBlob(mark)) return 'embedded';
+  return mark;
+}
+
+function hasAddress(img) {
+  return !!(img.getAttribute('src') || img.getAttribute('srcset'));
+}
+
+function boxOf(img) {
+  const r = img.getBoundingClientRect();
+  return {
+    bw: Math.round(r.width) || img.clientWidth || 0,
+    bh: Math.round(r.height) || img.clientHeight || 0
+  };
+}
+
+function extreme(bw, bh) {
+  if (!bw || !bh) return false;
+  const ar = bw / bh;
+  return ar > 5 || ar < 0.2;
+}
+
+function tooSmall(bw, bh) {
+  return Math.min(bw, bh) < opts.minSize;
+}
+
+function inViewport(img) {
+  const r = img.getBoundingClientRect();
+  if (r.width < 1 || r.height < 1) return false;
+  const m = 200;
+  return r.bottom > -m && r.right > -m && r.top < window.innerHeight + m && r.left < window.innerWidth + m;
+}
+
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function markSkip(img) {
+  img.dataset.couplexSkip = stableMark(img) || '1';
+}
+
+function styleSnapshot(img) {
+  return {
+    objectFit: img.style.objectFit,
+    objectPosition: img.style.objectPosition,
+    width: img.style.width,
+    height: img.style.height,
+    maxWidth: img.style.maxWidth,
+    maxHeight: img.style.maxHeight
+  };
+}
+
+function applyStyle(img, saved) {
+  if (!saved) return;
+  img.style.objectFit = saved.objectFit;
+  img.style.objectPosition = saved.objectPosition;
+  img.style.width = saved.width;
+  img.style.height = saved.height;
+  img.style.maxWidth = saved.maxWidth;
+  img.style.maxHeight = saved.maxHeight;
+}
+
+function setAttr(el, name, value) {
+  if (value == null) el.removeAttribute(name);
+  else el.setAttribute(name, value);
+}
+
+// Keep the original sources until the CDN file has actually loaded.
+function remember(img) {
+  if (SAVED.has(img)) return;
+  const pic = img.closest('picture');
+  const sources = [];
+  if (pic) pic.querySelectorAll('source').forEach((s) => sources.push(s.cloneNode(true)));
+  SAVED.set(img, {
+    src: img.getAttribute('src'),
+    srcset: img.getAttribute('srcset'),
+    sizes: img.getAttribute('sizes'),
+    loading: img.getAttribute('loading'),
+    sources,
+    style: styleSnapshot(img)
+  });
+}
+
+function stripSources(img) {
   const pic = img.closest('picture');
   if (pic) pic.querySelectorAll('source').forEach((s) => s.remove());
   img.removeAttribute('srcset');
   img.removeAttribute('sizes');
-  img.loading = 'eager';
   img.decoding = 'async';
+}
+
+function noteRemoved() {
+  if (replaced > 0) replaced -= 1;
+}
+
+function restore(img, base) {
+  const saved = SAVED.get(img);
+  const mark = saved ? (saved.src || saved.srcset || 'failed') : (markOf(img) || 'failed');
+  const state = SWAP.get(img);
+  if (state) state.abort.abort();
+  SWAP.delete(img);
+  delete img.dataset.couplex;
+  delete img.dataset.couplexRetry;
+  delete img.dataset.couplexUrl;
+  delete img.dataset.couplexName;
+  delete img.dataset.couplexRoll;
+  delete img.dataset.couplexWon;
+  img.dataset.couplexSkip = isDataOrBlob(mark) ? 'embedded' : mark;
+  applyStyle(img, saved && saved.style);
+  if (base) USED.delete(base);
+  noteRemoved();
+  if (!saved) return;
+  const pic = img.closest('picture');
+  if (pic && saved.sources.length) {
+    pic.querySelectorAll('source').forEach((s) => s.remove());
+    saved.sources.forEach((s) => pic.insertBefore(s, img));
+  }
+  setAttr(img, 'src', saved.src);
+  setAttr(img, 'srcset', saved.srcset);
+  setAttr(img, 'sizes', saved.sizes);
+  setAttr(img, 'loading', saved.loading);
+}
+
+function releaseForReroll(img) {
+  const state = SWAP.get(img);
+  if (state) state.abort.abort();
+  SWAP.delete(img);
+  if (state && state.base) USED.delete(state.base);
+  delete img.dataset.couplex;
+  delete img.dataset.couplexRetry;
+  delete img.dataset.couplexUrl;
+  delete img.dataset.couplexName;
+  delete img.dataset.couplexSkip;
+  delete img.dataset.couplexRoll;
+  delete img.dataset.couplexWon;
+  applyStyle(img, SAVED.get(img) && SAVED.get(img).style);
+  noteRemoved();
 }
 
 // Where to place the photo inside the element box so the head survives.
@@ -55,7 +220,7 @@ function place(item, bw, bh) {
   if (!bw || !bh) return { pos: '50% 50%', fit: true };
 
   const scale = Math.max(bw / iw, bh / ih); // object-fit: cover
-  const vw = bw / scale;                    // visible part of the photo, px
+  const vw = bw / scale;
   const vh = bh / scale;
 
   const f = item.f;
@@ -73,9 +238,7 @@ function place(item, bw, bh) {
   const hx = clamp(fx + fw / 2 - hw / 2, 0, Math.max(0, iw - hw));
   const hy = clamp(fy - fh * 0.7, 0, Math.max(0, ih - hh));
 
-  // the window is already smaller than the head — no crop can save it
   const fit = hw <= vw && hh <= vh;
-
   const x0 = iw > vw ? clamp(hx + hw / 2 - vw / 2, 0, iw - vw) : 0;
   const y0 = ih > vh ? clamp(hy + hh / 2 - vh / 2, 0, ih - vh) : 0;
   const px = iw > vw ? (x0 / (iw - vw)) * 100 : 50;
@@ -84,18 +247,31 @@ function place(item, bw, bh) {
   return { pos: `${px.toFixed(2)}% ${py.toFixed(2)}%`, fit };
 }
 
-// Pick a photo that fits the element's aspect ratio; for every photo there are
-// square, landscape and portrait crops, so the head always has room.
+function variantFor(base, ar) {
+  const list = VARIANTS.get(base);
+  if (!list || !list.length) return null;
+  let best = null;
+  let bestDiff = Infinity;
+  for (const it of list) {
+    const d = Math.abs(Math.log((it.w || 1) / (it.h || 1) / ar));
+    if (d < bestDiff) {
+      bestDiff = d;
+      best = it;
+    }
+  }
+  return best;
+}
+
+// Pick a photo that fits the element's aspect ratio. Each photo has square,
+// landscape and portrait crops, so the head has room. Never the same photo
+// twice until the set is exhausted.
 function choose(bw, bh) {
   if (!BASES.length) return null;
   const ar = bw && bh ? bw / bh : 1;
-  // skip extreme banners (5:1 and worse) — only a strip of a person would remain
-  if (ar > 5 || ar < 1 / 5) return null;
+  if (extreme(bw, bh)) return null;
 
-  // never show the same photo twice on one page
   const free = BASES.filter((b) => !USED.has(b));
   const pool = free.length ? free : BASES;
-
   const start = Math.floor(Math.random() * pool.length);
   let fallback = null;
   for (let k = 0; k < Math.min(6, pool.length); k += 1) {
@@ -113,185 +289,237 @@ function choose(bw, bh) {
   return fallback;
 }
 
-// photos live in the `data` branch of the repo: the list comes from
-// raw.githubusercontent (updates within a minute of a push), the files
-// themselves from jsDelivr pinned to the exact commit (immutable, cached)
-const RAW_INDEX = 'https://raw.githubusercontent.com/IamCaptainPepe/couplex/data/images/index.json';
-const BRANCH_API = 'https://api.github.com/repos/IamCaptainPepe/couplex/branches/data';
-const CDN_REF = 'https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@data/images/';
-const SHA_TTL = 3600 * 1000;
-let CDN = CDN_REF;
-
-// current commit of the data branch, so jsDelivr never serves a stale ref
-async function cdnRef() {
-  try {
-    const got = await new Promise((r) => chrome.storage.local.get({ couplexSha: null }, r));
-    const hit = got.couplexSha;
-    if (hit && hit.sha && Date.now() - hit.t < SHA_TTL) return hit.sha;
-  } catch (e) {
-    /* storage unavailable, ask the api */
-  }
-  try {
-    const res = await fetch(BRANCH_API, { cache: 'no-store' });
-    const sha = (await res.json()).commit.sha;
-    if (sha) chrome.storage.local.set({ couplexSha: { t: Date.now(), sha } });
-    return sha;
-  } catch (e) {
-    return '';
-  }
-}
-
-// name, crop suffix gives the shape
-function mergeScanned(files) {
-  const known = new Set(IMAGES.map((it) => it.n));
-  const shapes = { sq: 1, l: 1.5, p: 2 / 3 };
-  let added = 0;
-  for (const name of files || []) {
-    if (known.has(name)) continue;
-    const m = /^(.+)_(sq|l|p)\.(webp|avif|png|jpe?g)$/i.exec(name);
-    if (!m) continue;
-    const shape = shapes[m[2].toLowerCase()];
-    IMAGES.push({ n: name, w: Math.round(1000 * shape), h: 1000, f: null, b: m[1] });
-    added += 1;
-  }
-  return added;
-}
-
-// among the crops of one photo take the one closest to the element's shape
-function variantFor(base, ar) {  const list = VARIANTS.get(base);
-  if (!list || !list.length) return null;
-  let best = null;
-  let bestDiff = Infinity;
-  for (const it of list) {
-    const d = Math.abs(Math.log((it.w || 1) / (it.h || 1) / ar));
-    if (d < bestDiff) {
-      bestDiff = d;
-      best = it;
+function fail(img) {
+  if (img.dataset.couplex !== '1') return;
+  const name = img.dataset.couplexName;
+  if (!img.dataset.couplexRetry && name) {
+    const fallback = CDN_REF + name;
+    if (fallback !== img.src) {
+      img.dataset.couplexRetry = '1';
+      img.dataset.couplexUrl = fallback;
+      img.src = fallback;
+      return;
     }
   }
-  return best;
+  const state = SWAP.get(img);
+  restore(img, state && state.base);
 }
 
-function replace(img) {
-  if (!IMAGES.length || img.dataset.couplex === '1') return;
-  const rect = img.getBoundingClientRect();
-  const bw = Math.round(rect.width) || img.clientWidth || 0;
-  const bh = Math.round(rect.height) || img.clientHeight || 0;
+function landed(img, item, bw, bh) {
+  if (!img.isConnected || img.dataset.couplex !== '1') return;
+  const r = img.getBoundingClientRect();
+  let nw = Math.round(r.width) || bw;
+  let nh = Math.round(r.height) || bh;
+  // small slots have no CSS size of their own and would jump to the photo's
+  // natural size — pin them to the box we measured before the swap
+  const small = Math.max(bw, bh) < 320;
+  if (small || nw > bw * 1.25 || nh > bh * 1.25) {
+    img.style.width = `${bw}px`;
+    img.style.height = `${bh}px`;
+    img.style.maxWidth = `${bw}px`;
+    img.style.maxHeight = `${bh}px`;
+    nw = bw;
+    nh = bh;
+  }
+  img.style.objectPosition = place(item, nw, nh).pos;
+}
 
-  // the element has no layout yet (hidden menu, lazy node): swapping now would
-  // let the photo define the size and blow the page up. Try again later.
-  if (!bw || !bh) return;
-
+function swap(img, visible) {
+  if (!opts.enabled || !pageAgreed || !img.isConnected || img.dataset.couplex === '1') return;
+  if (!IMAGES.length) return;
+  if (io) io.unobserve(img);
+  const { bw, bh } = boxOf(img);
+  if (!bw || !bh) {
+    armSizeRetry(img);
+    return;
+  }
+  if (extreme(bw, bh) || (tooSmall(bw, bh) && img.naturalWidth)) {
+    markSkip(img);
+    return;
+  }
+  if (tooSmall(bw, bh)) {
+    armSizeRetry(img);
+    return;
+  }
   const picked = choose(bw, bh);
-  if (!picked) return;
+  if (!picked) {
+    markSkip(img);
+    return;
+  }
 
-  prepare(img);
+  remember(img);
+  stripSources(img);
+  const name = picked.item.n;
+  const url = CDN + name;
+  const prev = SWAP.get(img);
+  if (prev) prev.abort.abort();
+  const ac = new AbortController();
+  const base = picked.item.b || picked.item.n;
+  SWAP.set(img, { abort: ac, base });
+
   img.dataset.couplex = '1';
-  img.src = CDN + picked.item.n;
-
-  // a photo may be newer than the cached branch sha — fall back to the branch
-  img.addEventListener('error', function retry() {
-    if (img.dataset.couplexRetry) return;
-    img.dataset.couplexRetry = '1';
-    img.src = CDN_REF + picked.item.n;
-  }, { once: true });
+  img.dataset.couplexName = name;
+  img.dataset.couplexUrl = url;
+  img.decoding = 'async';
+  img.loading = visible ? 'eager' : 'lazy';
+  img.referrerPolicy = 'no-referrer';
+  if ('fetchPriority' in img) img.fetchPriority = visible ? 'high' : 'low';
   img.style.objectFit = 'cover';
   img.style.objectPosition = picked.pos;
-
-  // the box may resize once the new image is decoded — recompute then
-  img.addEventListener('load', () => {
-    if (!img.isConnected) return;
-    const r = img.getBoundingClientRect();
-    let nw = Math.round(r.width) || bw;
-    let nh = Math.round(r.height) || bh;
-    // small icons (avatars, favicons) have no CSS size of their own and would
-    // blow up to the full natural size of the photo — pin them to the old box
-    const small = Math.max(bw, bh) < 320;
-    if (small || nw > bw * 1.25 || nh > bh * 1.25) {
-      img.style.width = `${bw}px`;
-      img.style.height = `${bh}px`;
-      img.style.maxWidth = `${bw}px`;
-      img.style.maxHeight = `${bh}px`;
-      nw = bw;
-      nh = bh;
-    }
-    const p = place(picked.item, nw, nh);
-    img.style.objectPosition = p.pos;
-  }, { once: true });
-
+  img.addEventListener('error', () => fail(img), { signal: ac.signal });
+  img.addEventListener('load', () => landed(img, picked.item, bw, bh), { signal: ac.signal });
   replaced += 1;
+  img.src = url;
 }
 
-function bigEnough(img) {
-  const w = img.naturalWidth || img.width || 0;
-  const h = img.naturalHeight || img.height || 0;
-  return Math.min(w, h) >= opts.minSize;
-}
-
-function collect() {
-  return Array.from(document.images).filter(
-    (img) => img.dataset.couplex !== '1' && bigEnough(img) && img.src
-  );
-}
-
-function shuffle(a) {
-  for (let i = a.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
-function runBatch(list, fraction) {
-  const n = fraction >= 1 ? list.length : Math.floor(list.length * fraction);
-  shuffle(list).slice(0, n).forEach(replace);
-}
-
-function start() {
-  if (started) return;
-  started = true;
-
-  // one roll per page
-  pageAgreed = Math.random() * 100 < opts.pageChance;
-  if (!pageAgreed) return;
-
-  const all = collect();
-  candidates = all.length;
-  if (all.length) runBatch(all, opts.imagePercent / 100);
-
-  // images that arrive later (lazy-load, infinite feeds, SPAs) and images whose
-  // src is swapped in place (virtualised feeds like YouTube) — both count
-  const pending = new Set();
-  let scheduled = false;
-
-  const flush = () => {
-    scheduled = false;
-    const list = [...pending].filter(
-      (img) => img.isConnected && img.dataset.couplex !== '1' && img.src
-    );
-    pending.clear();
-    if (!list.length) return;
-    candidates += list.length;
-    for (const img of list) {
-      const mark = img.currentSrc || img.src;
-      if (img.dataset.couplexSkip === mark) continue; // already lost its roll
-      if (Math.random() * 100 < opts.imagePercent) replace(img);
-      else img.dataset.couplexSkip = mark;
+// No layout yet: watch this element only, and only for a short beat.
+// A full-document poll made every page pay for images that never got a box.
+function armSizeRetry(img) {
+  if (SIZE_WAIT.has(img) || img.dataset.couplex === '1') return;
+  let done = false;
+  let ro = null;
+  const timers = [];
+  const stop = () => {
+    if (done) return;
+    done = true;
+    SIZE_WAIT.delete(img);
+    img.removeEventListener('load', kick);
+    if (ro) ro.disconnect();
+    timers.forEach(clearTimeout);
+  };
+  const kick = () => {
+    if (done || !img.isConnected) {
+      stop();
+      return;
     }
+    const { bw, bh } = boxOf(img);
+    if (!bw || !bh) return;
+    if (tooSmall(bw, bh) && !img.naturalWidth) return;
+    stop();
+    consider(img);
   };
+  if (window.ResizeObserver) {
+    ro = new ResizeObserver(kick);
+    ro.observe(img);
+  }
+  img.addEventListener('load', kick);
+  timers.push(setTimeout(kick, 80), setTimeout(kick, 200), setTimeout(kick, 360));
+  timers.push(setTimeout(() => {
+    if (done) return;
+    stop();
+    if (!img.isConnected) return;
+    // one wait per address — a still-empty box must not schedule another
+    img.dataset.couplexWaited = stableMark(img) || '1';
+    const { bw, bh } = boxOf(img);
+    if (bw && bh) consider(img);
+  }, 520));
+  SIZE_WAIT.set(img, stop);
+}
 
-  const queue = (img) => {
-    if (!img || img.tagName !== 'IMG' || img.dataset.couplex === '1') return;
-    pending.add(img);
-    if (scheduled) return;
-    scheduled = true;
-    setTimeout(flush, 150);
-  };
+let io = null;
+function watchOffscreen(img) {
+  if (!img.isConnected || img.dataset.couplex === '1') return;
+  if (!io) {
+    io = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        io.unobserve(entry.target);
+        swap(entry.target, true);
+      }
+    }, { rootMargin: '200px' });
+  }
+  io.observe(img);
+}
 
+function consider(img) {
+  if (!opts.enabled || !pageAgreed || !img.isConnected || img.dataset.couplex === '1') return;
+  if (!hasAddress(img)) return;
+  const attrSrc = (img.getAttribute('src') || '').trim();
+  const cur = img.currentSrc || img.src || '';
+  if (isDataOrBlob(attrSrc) || isDataOrBlob(cur)) {
+    markSkip(img);
+    return;
+  }
+  if (isOurUrl(cur)) return;
+  const mark = stableMark(img);
+  if (img.dataset.couplexSkip && img.dataset.couplexSkip === (mark || '1')) return;
+
+  const { bw, bh } = boxOf(img);
+  if (!bw || !bh) {
+    armSizeRetry(img);
+    return;
+  }
+  if (extreme(bw, bh)) {
+    markSkip(img);
+    return;
+  }
+  if (tooSmall(bw, bh)) {
+    const waited = img.dataset.couplexWaited === (stableMark(img) || '1');
+    if (!img.naturalWidth && !waited) armSizeRetry(img);
+    else markSkip(img);
+    return;
+  }
+
+  const token = stableMark(img);
+  if (img.dataset.couplexRoll !== token) {
+    img.dataset.couplexRoll = token;
+    img.dataset.couplexWon = Math.random() * 100 < opts.imagePercent ? '1' : '0';
+    candidates += 1;
+  }
+  if (img.dataset.couplexWon !== '1') {
+    markSkip(img);
+    return;
+  }
+  if (inViewport(img)) swap(img, true);
+  else watchOffscreen(img);
+}
+
+const pending = new Set();
+let scheduled = false;
+function queue(img) {
+  if (!img || img.tagName !== 'IMG') return;
+  pending.add(img);
+  if (scheduled) return;
+  scheduled = true;
+  requestAnimationFrame(flush);
+}
+function flush() {
+  scheduled = false;
+  const list = [...pending];
+  pending.clear();
+  for (const img of list) consider(img);
+}
+
+function onAttr(img) {
+  if (!img || img.tagName !== 'IMG') return;
+  const src = img.currentSrc || img.src || '';
+  if (img.dataset.couplex === '1') {
+    if (isOurUrl(src)) return;
+    // the page reused this element and pointed it at a new file
+    releaseForReroll(img);
+    queue(img);
+    return;
+  }
+  if (isDataOrBlob((img.getAttribute('src') || '').trim()) || isDataOrBlob(src)) {
+    markSkip(img);
+    return;
+  }
+  const mark = stableMark(img) || '1';
+  if (img.dataset.couplexSkip === mark) return;
+  if (img.dataset.couplexSkip) {
+    delete img.dataset.couplexSkip;
+    delete img.dataset.couplexRoll;
+    delete img.dataset.couplexWon;
+    delete img.dataset.couplexWaited;
+  }
+  queue(img);
+}
+
+function installObserver() {
   const mo = new MutationObserver((muts) => {
     for (const m of muts) {
       if (m.type === 'attributes') {
-        queue(m.target);
+        onAttr(m.target);
         continue;
       }
       for (const node of m.addedNodes) {
@@ -307,30 +535,63 @@ function start() {
     attributes: true,
     attributeFilter: ['src', 'srcset']
   });
-
-  // safety net: some feeds reuse nodes and never fire a mutation we can see
-  setInterval(() => {
-    let n = 0;
-    for (const img of document.images) {
-      if (n >= 40) break;
-      if (img.dataset.couplex === '1' || !img.src) continue;
-      const mark = img.currentSrc || img.src;
-      if (img.dataset.couplexSkip === mark) continue;
-      const r = img.getBoundingClientRect();
-      if (r.width < 16 || r.height < 16) continue; // offscreen or lazy placeholder
-      queue(img);
-      n += 1;
-    }
-  }, 2000);
 }
 
-const INDEX_TTL = 6 * 3600 * 1000;
-const lget = (d) => new Promise((r) => chrome.storage.local.get(d, r));
-const lset = (o) => new Promise((r) => chrome.storage.local.set(o, () => r()));
+function start() {
+  if (started) return;
+  started = true;
+  installObserver();
+
+  const ready = [];
+  const waiting = [];
+  for (const img of document.images) {
+    if (!hasAddress(img)) continue;
+    const attrSrc = (img.getAttribute('src') || '').trim();
+    const cur = img.currentSrc || img.src || '';
+    if (isDataOrBlob(attrSrc) || isDataOrBlob(cur) || isOurUrl(cur)) {
+      if (!isOurUrl(cur)) markSkip(img);
+      continue;
+    }
+    const { bw, bh } = boxOf(img);
+    if (!bw || !bh || (tooSmall(bw, bh) && !img.naturalWidth)) {
+      waiting.push(img);
+      continue;
+    }
+    if (extreme(bw, bh) || tooSmall(bw, bh)) {
+      markSkip(img);
+      continue;
+    }
+    ready.push(img);
+  }
+
+  const fraction = opts.imagePercent / 100;
+  const n = fraction >= 1 ? ready.length : Math.floor(ready.length * fraction);
+  const visible = [];
+  const hidden = [];
+  for (const img of ready) (inViewport(img) ? visible : hidden).push(img);
+  shuffle(visible);
+  shuffle(hidden);
+  const winners = new Set([...visible, ...hidden].slice(0, n));
+
+  for (const img of ready) {
+    img.dataset.couplexRoll = stableMark(img) || '1';
+    candidates += 1;
+    if (!winners.has(img)) {
+      img.dataset.couplexWon = '0';
+      markSkip(img);
+      continue;
+    }
+    img.dataset.couplexWon = '1';
+    if (inViewport(img)) swap(img, true);
+    else watchOffscreen(img);
+  }
+  for (const img of waiting) armSizeRetry(img);
+}
 
 async function apiSha() {
   try {
     const res = await fetch(BRANCH_API, { cache: 'no-store' });
+    if (!res.ok) return '';
     const j = await res.json();
     return (j && j.commit && j.commit.sha) || '';
   } catch (e) {
@@ -343,8 +604,11 @@ async function fetchIndex(sha) {
   for (const url of sources) {
     try {
       const res = await fetch(url, { cache: url === RAW_INDEX ? 'no-cache' : 'force-cache' });
+      if (!res.ok) continue;
       const data = await res.json();
-      const list = Array.isArray(data) ? data.map((n) => ({ n, w: 0, h: 0, f: null, b: n })) : data.images;
+      const list = Array.isArray(data)
+        ? data.map((name) => ({ n: name, w: 0, h: 0, f: null, b: name }))
+        : data.images;
       if (list && list.length) return list;
     } catch (e) {
       /* next source */
@@ -367,45 +631,53 @@ function applyIndex(list) {
   }
 }
 
-// the first screenful of a feed should not wait for the network at all
+// A handful of likely crops, and only after this page won its roll.
 function warmCache(n) {
-  const idle = window.requestIdleCallback || ((f) => setTimeout(f, 900));
+  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 400));
   idle(() => {
-    if (!BASES.length) return;
+    if (!pageAgreed || !BASES.length) return;
     const pool = BASES.slice();
-    for (let i = pool.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [pool[i], pool[j]] = [pool[j], pool[i]];
-    }
+    shuffle(pool);
     for (const b of pool.slice(0, n)) {
       const it = variantFor(b, 1.5) || (VARIANTS.get(b) || [])[0];
       if (!it) continue;
       const im = new Image();
       im.decoding = 'async';
+      im.referrerPolicy = 'no-referrer';
       im.src = CDN + it.n;
     }
   });
 }
 
-// everything network-related happens after the first frame
 async function refresh() {
   const got = await lget({ couplexSha: null, couplexIndex: null });
   let sha = (got.couplexSha && got.couplexSha.sha) || '';
-  if (!sha || Date.now() - (got.couplexSha.t || 0) > SHA_TTL) {
+  const age = got.couplexSha ? Date.now() - (got.couplexSha.t || 0) : Infinity;
+  if (!sha || age > SHA_TTL) {
     const fresh = await apiSha();
     if (fresh) {
       sha = fresh;
-      lset({ couplexSha: { t: Date.now(), sha } });
+      await lset({ couplexSha: { t: Date.now(), sha } });
     }
   }
-  if (sha) CDN = `https://cdn.jsdelivr.net/gh/IamCaptainPepe/couplex@${sha}/images/`;
+  if (sha) CDN = pinned(sha);
 
-  const stale = !got.couplexIndex || Date.now() - got.couplexIndex.t > INDEX_TTL;
-  if (!stale) return;
+  const cached = got.couplexIndex;
+  const freshIdx = cached && Date.now() - cached.t < INDEX_TTL && cached.list && cached.list.length;
+  const sameSha = freshIdx && cached.sha === sha && sha;
+  if (sameSha) {
+    if (!BASES.length) applyIndex(cached.list);
+    return;
+  }
+  if (!sha && freshIdx) {
+    if (!BASES.length) applyIndex(cached.list);
+    return;
+  }
+
   const list = await fetchIndex(sha);
   if (!list) return;
   applyIndex(list);
-  lset({ couplexIndex: { t: Date.now(), list } });
+  await lset({ couplexIndex: { t: Date.now(), sha: sha || '', list } });
 }
 
 async function load() {
@@ -413,41 +685,52 @@ async function load() {
   opts = { ...DEFAULTS, ...stored[KEY] };
   if (!opts.enabled) return;
 
-  // instant path: whatever was cached from the previous page
-  const got = await lget({ couplexIndex: null });
+  const got = await lget({ couplexSha: null, couplexIndex: null });
+  const sha = (got.couplexSha && got.couplexSha.sha) || '';
+  if (sha) CDN = pinned(sha);
   if (got.couplexIndex && got.couplexIndex.list && got.couplexIndex.list.length) {
     applyIndex(got.couplexIndex.list);
-    start();
-    warmCache(24);
   }
 
-  // slow path: refresh the commit sha and the index in the background
-  refresh().then(() => {
+  if (!BASES.length) {
+    await refresh();
     if (!BASES.length) return;
+  }
+
+  pageAgreed = Math.random() * 100 < opts.pageChance;
+  if (!pageAgreed) {
+    // no photo requests on a page that lost the roll; refresh only the index
+    refresh().catch(() => {});
+    return;
+  }
+
+  // one frame: boxes are real, and the swap still lands before the next paint
+  requestAnimationFrame(() => {
     start();
-    if (!got.couplexIndex) warmCache(24);
+    refresh().then(() => warmCache(6)).catch(() => {});
   });
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg && msg.type === 'couplex:stats') {
-    sendResponse({
-      ok: true,
-      replaced,
-      candidates,
-      pageAgreed,
-      images: BASES.length,
-      options: opts
-    });
-  }
-  return true;
+  if (!msg || msg.type !== 'couplex:stats') return undefined;
+  sendResponse({
+    ok: true,
+    replaced,
+    candidates,
+    pageAgreed,
+    images: BASES.length,
+    options: opts
+  });
+  return undefined;
 });
 
-// popup changed the settings — reloading the page applies them
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'sync' && changes[KEY]) {
     opts = { ...DEFAULTS, ...changes[KEY].newValue };
   }
 });
 
-load();
+load().catch(() => {});
+
+// Сделано на CyOps: видимые кадры меняются сразу с закреплённого SHA,
+// оригинал возвращается, если CDN не открылся.
