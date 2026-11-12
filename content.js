@@ -330,9 +330,14 @@ function categoryOf(base) {
   return m ? m[1].toLowerCase() : '?';
 }
 
-// j and w are Janitor Oil ads. One of them per 14 other photos, never a run.
+// i, k iconic (the funny shots): one extra photo per round.
+// a, v press covers: every other round.
+// j, w Janitor Oil ads: one per 22 other photos.
+// m meme, e/u emotion, x era, c/h chaos, y action: one turn each.
+const ICONIC = new Set(['i', 'k']);
+const PRESS = new Set(['a', 'v']);
 const OIL_CATS = new Set(['j', 'w']);
-const OIL_EVERY = 14;
+const OIL_EVERY = 22;
 
 // Categories take turns, so one generation series does not follow itself.
 // The same photo still waits until the rest of the deck has been used.
@@ -346,32 +351,153 @@ function refillDeck() {
   for (const list of groups.values()) shuffle(list);
 
   const oil = [];
-  for (const cat of OIL_CATS) {
-    if (!groups.has(cat)) continue;
-    oil.push(...groups.get(cat));
-    groups.delete(cat);
+  const iconic = new Map();
+  for (const [cat, list] of [...groups.entries()]) {
+    if (OIL_CATS.has(cat)) {
+      oil.push(...list);
+      groups.delete(cat);
+    } else if (ICONIC.has(cat)) {
+      iconic.set(cat, list);
+      groups.delete(cat);
+    }
   }
   shuffle(oil);
   const keys = shuffle([...groups.keys()]);
+  const iconicKeys = shuffle([...iconic.keys()]);
+  let iconicAt = 0;
   const out = [];
   let sinceOil = 0;
-  if (!keys.length) {
+
+  function prevCat() {
+    return out.length ? categoryOf(out[out.length - 1]) : '';
+  }
+
+  function emit(base) {
+    out.push(base);
+    if (OIL_CATS.has(categoryOf(base))) {
+      sinceOil = 0;
+      return;
+    }
+    sinceOil += 1;
+    if (oil.length && sinceOil >= OIL_EVERY) {
+      out.push(oil.pop());
+      sinceOil = 0;
+    }
+  }
+
+  function iconicStock() {
+    let n = 0;
+    for (const list of iconic.values()) n += list.length;
+    return n;
+  }
+
+  // Pass 0 skips the prefix we just showed. Pass 1 allows it when nothing else is left.
+  function pullIconic(avoid) {
+    const n = iconicKeys.length;
+    if (!n) return null;
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (let s = 0; s < n; s += 1) {
+        const idx = (iconicAt + s) % n;
+        const key = iconicKeys[idx];
+        const list = iconic.get(key);
+        if (!list.length) continue;
+        if (pass === 0 && key === avoid) continue;
+        iconicAt = (idx + 1) % n;
+        return list.pop();
+      }
+    }
+    return null;
+  }
+
+  function dealIconic(avoid) {
+    const base = pullIconic(avoid);
+    if (!base) return false;
+    emit(base);
+    return true;
+  }
+
+  if (!keys.length && !iconicStock()) {
     deck = oil;
     deckPos = 0;
     return;
   }
-  while (keys.some((key) => groups.get(key).length)) {
+
+  let round = 0;
+  let guard = 0;
+  while ((keys.some((key) => groups.get(key).length) || iconicStock()) && guard < 20000) {
+    guard += 1;
+    const tokens = [];
     for (const key of keys) {
-      const list = groups.get(key);
-      if (!list.length) continue;
-      out.push(list.pop());
-      sinceOil += 1;
-      if (oil.length && sinceOil >= OIL_EVERY) {
-        out.push(oil.pop());
-        sinceOil = 0;
+      if (!groups.get(key).length) continue;
+      if (PRESS.has(key) && round % 2 === 1) continue;
+      tokens.push(key);
+    }
+    if (!tokens.length) {
+      for (const key of keys) {
+        if (groups.get(key).length) tokens.push(key);
       }
     }
+    const prev = prevCat();
+    if (prev && tokens.length > 1 && tokens[0] === prev) {
+      const shift = tokens.findIndex((key) => key !== prev);
+      if (shift > 0) tokens.push(...tokens.splice(0, shift));
+    }
+
+    const alive = iconicKeys.filter((key) => iconic.get(key).length).length;
+    let budget = alive ? Math.min(alive + 1, iconicStock()) : 0;
+    const seq = [];
+    if (tokens.length && budget) {
+      const place = Math.min(budget, tokens.length);
+      const stride = Math.max(1, Math.floor(tokens.length / place));
+      let placed = 0;
+      tokens.forEach((key, idx) => {
+        seq.push(key);
+        const between = idx !== tokens.length - 1;
+        if (placed < place && between && (idx + 1) % stride === 0) {
+          seq.push('*');
+          placed += 1;
+        }
+      });
+      budget -= placed;
+    } else {
+      tokens.forEach((key) => seq.push(key));
+    }
+
+    let emitted = 0;
+    for (const step of seq) {
+      if (step === '*') {
+        if (dealIconic(prevCat())) emitted += 1;
+        continue;
+      }
+      const list = groups.get(step);
+      if (!list.length) continue;
+      if (prevCat() === step && (tokens.length > 1 || iconicStock())) continue;
+      emit(list.pop());
+      emitted += 1;
+    }
+    while (budget > 0 && iconicStock() && !ICONIC.has(prevCat())) {
+      if (!dealIconic(prevCat())) break;
+      emitted += 1;
+      budget -= 1;
+    }
+    if (!emitted) {
+      let dumped = false;
+      for (const key of keys) {
+        const list = groups.get(key);
+        if (!list.length) continue;
+        emit(list.pop());
+        dumped = true;
+        break;
+      }
+      if (!dumped && !dealIconic('')) break;
+    }
+    round += 1;
   }
+  if (guard >= 20000) {
+    for (const list of groups.values()) while (list.length) out.push(list.pop());
+    for (const list of iconic.values()) while (list.length) out.push(list.pop());
+  }
+
   deck = out;
   deckPos = 0;
   const prev = categoryOf(lastPicked);
@@ -823,4 +949,4 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 load().catch(() => { if (!pageAgreed) hideVeil(); });
 
-// Done on CyOps: categories take turns. Janitor Oil ads (j and w) appear about once every 14 photos.
+// Done on CyOps: iconic shots (i, k) deal a little more often, press covers less often, Janitor Oil about once every 22 photos.
