@@ -330,7 +330,8 @@ function categoryOf(base) {
   return m ? m[1].toLowerCase() : '?';
 }
 
-// One oil ad per 14 other photos. Often enough to land the joke, not a run of bottles.
+// j and w are Janitor Oil ads. One of them per 14 other photos, never a run.
+const OIL_CATS = new Set(['j', 'w']);
 const OIL_EVERY = 14;
 
 // Categories take turns, so one generation series does not follow itself.
@@ -344,8 +345,13 @@ function refillDeck() {
   }
   for (const list of groups.values()) shuffle(list);
 
-  const oil = groups.get('j') || [];
-  groups.delete('j');
+  const oil = [];
+  for (const cat of OIL_CATS) {
+    if (!groups.has(cat)) continue;
+    oil.push(...groups.get(cat));
+    groups.delete(cat);
+  }
+  shuffle(oil);
   const keys = shuffle([...groups.keys()]);
   const out = [];
   let sinceOil = 0;
@@ -817,4 +823,4 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 load().catch(() => { if (!pageAgreed) hideVeil(); });
 
-// Done on CyOps: categories take turns, and a Janitor Oil ad appears about once every 14 photos.
+// Done on CyOps: categories take turns. Janitor Oil ads (j and w) appear about once every 14 photos.
