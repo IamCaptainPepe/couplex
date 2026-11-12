@@ -65,10 +65,22 @@ async function init() {
   if (norm.migrated) chrome.storage.sync.set({ [KEY]: norm.opts });
   paint(norm.opts);
 
+  const sources = [
+    'https://raw.githubusercontent.com/IamCaptainPepe/couplex/data/images/index.json',
+    chrome.runtime.getURL('images/index.json'),
+  ];
   try {
-    const res = await fetch(chrome.runtime.getURL('images/index.json'));
-    const data = await res.json();
-    const list = Array.isArray(data) ? data : data.images || [];
+    let list = null;
+    for (const src of sources) {
+      try {
+        const res = await fetch(src, { cache: 'no-store' });
+        if (!res.ok) continue;
+        const data = await res.json();
+        list = Array.isArray(data) ? data : data.images || [];
+        if (list.length) break;
+      } catch (e) { /* try next source */ }
+    }
+    if (!list) throw new Error('no index');
     el('setCount').textContent = new Set(list.map((it) => (it && it.b) || it)).size;
   } catch (e) {
     el('setCount').textContent = '0';
