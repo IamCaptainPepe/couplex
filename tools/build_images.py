@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Собирает папку images/ для расширения: PNG/JPG -> AVIF (или WebP) + index.json.
+"""Build the extension's images/ folder: PNG/JPG -> AVIF (or WebP) + index.json.
 
-Использование:
-    python3 tools/build_images.py <папка_с_исходниками> [--max 768] [--quality 52]
+Usage:
+    python3 tools/build_images.py <source_folder> [--max 768] [--quality 52]
                                   [--format avif|webp] [--speed 6] [--incremental]
 
-Для каждого фото детектится лицо (insightface buffalo_l) и из оригинала режется
-три варианта пропорций — квадрат, альбом 3:2 и портрет 2:3, все с головой по
-центру. В index.json по каждому варианту пишется рамка лица в долях кадра:
-content.js берёт вариант под пропорции слота, поэтому голова не обрезается.
+Each photo is face-detected (insightface buffalo_l) and cut from the original
+into three aspect ratios — square, 3:2 landscape and 2:3 portrait — with the
+head kept in frame. index.json stores the face box as fractions of the frame.
+content.js picks the crop that matches the slot, so the head is not cut off.
 
---incremental дописывает только новые исходники к уже собранному index.json
-(старые файлы не перекодируются) — так можно докидывать фото по мере генерации.
+--incremental appends only new sources to the existing index.json
+(old files are not re-encoded), so photos can be added as they are generated.
 
-Запускать интерпретатором, где есть insightface (venv ComfyUI):
+Run it with an interpreter that has insightface (ComfyUI venv):
     /home/openclaw/ComfyUI/venv/bin/python tools/build_images.py _src2
 """
 import argparse
@@ -28,7 +28,7 @@ OUT = os.path.join(ROOT, "images")
 EXTS = (".png", ".jpg", ".jpeg", ".webp")
 INSIGHT_ROOT = os.environ.get("INSIGHT_ROOT", "/home/openclaw/ComfyUI/models/insightface")
 
-# суффикс -> пропорции кадра
+# suffix -> frame aspect ratio
 ASPECTS = (("sq", 1.0), ("l", 1.5), ("p", 2 / 3))
 
 _app = None
@@ -45,7 +45,7 @@ def detector():
 
 
 def face_box(im):
-    """Рамка самого крупного лица в долях кадра [x, y, w, h] или None."""
+    """Largest face box as fractions of the frame [x, y, w, h], or None."""
     import numpy as np
 
     bgr = np.array(im.convert("RGB"))[:, :, ::-1]
@@ -63,7 +63,7 @@ def clamp(v, lo, hi):
 
 
 def crop_variant(im, box, aspect, maxside):
-    """Режет кадр под нужные пропорции, держа голову по центру."""
+    """Crop the frame to the target aspect, keeping the head centered."""
     W, H = im.size
     if aspect >= 1:
         w = min(W, H * aspect)
@@ -109,13 +109,13 @@ def main():
     ap.add_argument("--max", type=int, default=768)
     ap.add_argument("--quality", type=int, default=52)
     ap.add_argument("--format", choices=("avif", "webp"), default="avif")
-    ap.add_argument("--speed", type=int, default=6, help="AVIF speed: 0 медленно/лучше, 10 быстро/хуже")
-    ap.add_argument("--incremental", action="store_true", help="докодировать только новые исходники")
+    ap.add_argument("--speed", type=int, default=6, help="AVIF speed: 0 slow/better, 10 fast/worse")
+    ap.add_argument("--incremental", action="store_true", help="encode only new source files")
     a = ap.parse_args()
 
     src = os.path.expanduser(a.src)
     if not os.path.isdir(src):
-        sys.exit(f"нет папки {src}")
+        sys.exit(f"no such folder: {src}")
 
     os.makedirs(OUT, exist_ok=True)
     ext = "." + a.format
@@ -128,7 +128,7 @@ def main():
             old = json.load(fh)
         items = old.get("images", [])
         seen = {it["b"] for it in items}
-        print(f"[inc] в наборе уже {len(seen)} фото")
+        print(f"[inc] set already has {len(seen)} photos")
 
     total = 0
     no_face = 0
@@ -156,7 +156,7 @@ def main():
         except Exception as e:
             print(f"[skip] {f}: {e}")
         if added and added % 25 == 0:
-            print(f"  +{added} (просмотрено {i}/{len(files)})", flush=True)
+            print(f"  +{added} (scanned {i}/{len(files)})", flush=True)
 
     index = {"version": 4, "format": a.format, "max": a.max, "images": items}
     with open(index_path, "w") as fh:
@@ -165,9 +165,9 @@ def main():
     size = sum(os.path.getsize(os.path.join(OUT, it["n"])) for it in items)
     per_photo = size / max(len(seen), 1)
     print(
-        f"готово: в наборе {len(seen)} фото, {len(items)} файлов, {size / 1e6:.1f} МБ, "
-        f"средний файл {per_photo / 3 / 1024:.0f} КБ, среднее фото {per_photo / 1024:.0f} КБ, "
-        f"новых {added}, без лица {no_face}"
+        f"done: {len(seen)} photos, {len(items)} files, {size / 1e6:.1f} MB, "
+        f"mean file {per_photo / 3 / 1024:.0f} KB, mean photo {per_photo / 1024:.0f} KB, "
+        f"new {added}, no face {no_face}"
     )
 
 

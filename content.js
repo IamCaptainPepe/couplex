@@ -732,5 +732,5 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 load().catch(() => {});
 
-// Сделано на CyOps: видимые кадры меняются сразу с закреплённого SHA,
-// оригинал возвращается, если CDN не открылся.
+// Done on CyOps: visible frames swap immediately from the pinned SHA,
+// and the original is restored if the CDN does not open.
